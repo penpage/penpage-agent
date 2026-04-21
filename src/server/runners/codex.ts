@@ -15,8 +15,13 @@ export const codexRunner: AIRunner = {
     }
   },
 
-  run(prompt: string, cwd: string, _options?: RunOptions): ChildProcess {
-    const child = spawn('codex', ['exec', '--skip-git-repo-check', prompt], {
+  run(prompt: string, cwd: string, options?: RunOptions): ChildProcess {
+    const args = ['exec', '--skip-git-repo-check'];
+    if (options?.model) {
+      args.push('--model', options.model);
+    }
+    args.push(prompt);
+    const child = spawn('codex', args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env },

@@ -176,12 +176,13 @@ export async function aiRoutes(app: FastifyInstance) {
 
   // Run AI prompt with SSE streaming
   app.post('/api/ai/run', async (request, reply) => {
-    const { prompt, tool, cwd, sessionId, model } = request.body as {
+    const { prompt, tool, cwd, sessionId, model, permissionMode } = request.body as {
       prompt: string;
       tool: string;
       cwd: string;
       sessionId?: string;
       model?: string;
+      permissionMode?: 'auto' | 'plan';
     };
 
     if (!prompt || !tool || !cwd) {
@@ -204,7 +205,7 @@ export async function aiRoutes(app: FastifyInstance) {
       Connection: 'keep-alive',
     });
 
-    const child = runner.run(prompt, cwd, { sessionId, model });
+    const child = runner.run(prompt, cwd, { sessionId, model, permissionMode });
 
     // Buffer for incomplete JSON lines
     let stdoutBuffer = '';
@@ -278,6 +279,10 @@ export async function aiRoutes(app: FastifyInstance) {
                   turns: event.num_turns,
                   contextUsed,
                   contextWindow,
+                  inputTokens: usage.input_tokens || 0,
+                  outputTokens: usage.output_tokens || 0,
+                  cacheRead: usage.cache_read_input_tokens || 0,
+                  cacheCreation: usage.cache_creation_input_tokens || 0,
                 },
               })}\n\n`);
               continue;

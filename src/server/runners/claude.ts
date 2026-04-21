@@ -23,6 +23,9 @@ export const claudeRunner: AIRunner = {
     if (options?.model) {
       args.push('--model', options.model);
     }
+    if (options?.permissionMode === 'plan') {
+      args.push('--permission-mode', 'plan');
+    }
 
     const child = spawn('claude', args, {
       cwd,

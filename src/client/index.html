@@ -16,12 +16,19 @@
     </main>
     <footer class="footer">
       <div class="footer-top">
+        <div id="mode-toggle" class="mode-toggle">
+          <button class="mode-btn active" data-mode="plan">Plan</button>
+          <button class="mode-btn" data-mode="auto">Auto</button>
+        </div>
         <div id="session-bar" class="session-bar"></div>
-        <div id="tool-selector" class="tool-selector"></div>
       </div>
       <div class="input-area">
         <textarea id="prompt-input" placeholder="Enter your prompt... (Cmd+Enter to send, /help for commands)" rows="3"></textarea>
-        <button id="send-btn" class="send-btn">Run</button>
+        <div class="run-split">
+          <button id="send-btn" class="send-btn">Run</button>
+          <button id="menu-dropdown-btn" class="send-btn menu-arrow">▾</button>
+          <div id="run-menu" class="run-menu hidden"></div>
+        </div>
       </div>
     </footer>
   </div>

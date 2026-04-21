@@ -15,21 +15,50 @@ interface SessionInfo {
   turns: number;
   contextWindow: number;
   contextUsed: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheRead: number;
+  cacheCreation: number;
 }
 
 let selectedTool: string = '';
 let isRunning = false;
 let config: Config = { cwd: '' };
 let currentModel: string = '';
+let permissionMode: 'auto' | 'plan' = 'plan';
+
+const toolModels: Record<string, Array<{ value: string; label: string }>> = {
+  claude: [
+    { value: '', label: 'Default' },
+    { value: 'sonnet', label: 'Sonnet' },
+    { value: 'opus', label: 'Opus' },
+    { value: 'haiku', label: 'Haiku' },
+  ],
+  gemini: [
+    { value: '', label: 'Default' },
+    { value: 'gemini-2.5-pro', label: '2.5 Pro' },
+    { value: 'gemini-2.5-flash', label: '2.5 Flash' },
+    { value: 'gemini-2.0-flash', label: '2.0 Flash' },
+  ],
+  codex: [
+    { value: '', label: 'Default' },
+    { value: 'o3', label: 'o3' },
+    { value: 'o4-mini', label: 'o4-mini' },
+    { value: 'codex-mini', label: 'codex-mini' },
+  ],
+};
 
 // Session tracking per tool
 const sessions: Record<string, SessionInfo> = {};
+let availableTools: ToolInfo[] = [];
 
 const messagesEl = document.getElementById('messages') as HTMLDivElement;
 const promptInput = document.getElementById('prompt-input') as HTMLTextAreaElement;
 const sendBtn = document.getElementById('send-btn') as HTMLButtonElement;
-const toolSelectorEl = document.getElementById('tool-selector') as HTMLDivElement;
 const sessionBarEl = document.getElementById('session-bar') as HTMLDivElement;
+const modeToggleEl = document.getElementById('mode-toggle') as HTMLDivElement;
+const menuDropdownBtn = document.getElementById('menu-dropdown-btn') as HTMLButtonElement;
+const runMenu = document.getElementById('run-menu') as HTMLDivElement;
 
 // Initialize
 async function init() {
@@ -44,35 +73,77 @@ async function init() {
     return;
   }
 
-  renderToolSelector(tools);
+  availableTools = tools;
   selectedTool = tools[0].name;
-  updateToolButtons();
+  initRunMenu();
+  initModeToggle();
+  updateRunButton();
   updateSessionBar();
 
   showEmptyState(`Ready. Using ${tools[0].displayName} in ${config.cwd}`);
 }
 
-function renderToolSelector(tools: ToolInfo[]) {
-  toolSelectorEl.innerHTML = tools
-    .map(
-      (t) =>
-        `<button class="tool-btn" data-tool="${t.name}">${t.displayName}</button>`
-    )
-    .join('');
-
-  toolSelectorEl.addEventListener('click', (e) => {
-    const btn = (e.target as HTMLElement).closest('.tool-btn') as HTMLElement;
+function initModeToggle() {
+  modeToggleEl.addEventListener('click', (e) => {
+    const btn = (e.target as HTMLElement).closest('.mode-btn') as HTMLElement;
     if (!btn || isRunning) return;
-    selectedTool = btn.dataset.tool!;
-    updateToolButtons();
-    updateSessionBar();
+    permissionMode = btn.dataset.mode as 'auto' | 'plan';
+    modeToggleEl.querySelectorAll('.mode-btn').forEach((b) => {
+      (b as HTMLElement).classList.toggle('active', (b as HTMLElement).dataset.mode === permissionMode);
+    });
   });
 }
 
-function updateToolButtons() {
-  toolSelectorEl.querySelectorAll('.tool-btn').forEach((btn) => {
-    const el = btn as HTMLElement;
-    el.classList.toggle('active', el.dataset.tool === selectedTool);
+function updateRunButton() {
+  const toolLabel = availableTools.find((t) => t.name === selectedTool)?.displayName || selectedTool;
+  const parts = [toolLabel];
+  if (currentModel) parts.push(currentModel);
+  sendBtn.textContent = parts.join(' · ');
+}
+
+function renderRunMenu() {
+  let html = '';
+
+  for (const t of availableTools) {
+    const models = toolModels[t.name] || [{ value: '', label: 'Default' }];
+    const toolShort = t.name.charAt(0).toUpperCase() + t.name.slice(1);
+    for (const m of models) {
+      const active = t.name === selectedTool && m.value === currentModel ? ' active' : '';
+      const label = m.value ? `${toolShort} - ${m.label}` : toolShort;
+      html += `<div class="run-menu-item${active}" data-tool="${t.name}" data-model="${m.value}">${label}</div>`;
+    }
+  }
+
+  runMenu.innerHTML = html;
+}
+
+function initRunMenu() {
+  menuDropdownBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    renderRunMenu();
+    runMenu.classList.toggle('hidden');
+  });
+
+  runMenu.addEventListener('click', (e) => {
+    const item = (e.target as HTMLElement).closest('.run-menu-item') as HTMLElement;
+    if (!item) return;
+
+    const newTool = item.dataset.tool || '';
+    const newModel = item.dataset.model || '';
+
+    if (newTool !== selectedTool) {
+      selectedTool = newTool;
+      updateSessionBar();
+    }
+    currentModel = newModel;
+
+    updateRunButton();
+    runMenu.classList.add('hidden');
+  });
+
+  // Close menu on outside click
+  document.addEventListener('click', () => {
+    runMenu.classList.add('hidden');
   });
 }
 
@@ -88,12 +159,23 @@ function updateSessionBar() {
       const fillClass = pct > 80 ? 'danger' : pct > 60 ? 'warn' : '';
       const usedK = Math.round(session.contextUsed / 1000);
       const totalK = Math.round(session.contextWindow / 1000);
+      const fillColor = pct > 80 ? '#ef5350' : pct > 60 ? '#ffb74d' : '#ffd54f';
       contextHtml = `
         <span class="session-context">
-          <span class="context-bar"><span class="context-bar-fill ${fillClass}" style="width: ${pct}%"></span></span>
+          <span class="context-bar" style="background: linear-gradient(to right, ${fillColor} ${pct}%, rgba(255,255,255,0.1) ${pct}%)"></span>
           ${pct}% ${usedK}k/${totalK}k
         </span>
       `;
+    }
+
+    // Token breakdown
+    let tokenHtml = '';
+    if (session.inputTokens > 0 || session.outputTokens > 0) {
+      const inK = (session.inputTokens / 1000).toFixed(1);
+      const outK = (session.outputTokens / 1000).toFixed(1);
+      const parts = [`in:${inK}k`, `out:${outK}k`];
+      if (session.cacheRead > 0) parts.push(`cache:${(session.cacheRead / 1000).toFixed(1)}k`);
+      tokenHtml = `<span class="session-tokens">${parts.join(' ')}</span>`;
     }
 
     sessionBarEl.innerHTML = `
@@ -101,18 +183,10 @@ function updateSessionBar() {
       <span class="session-model">${session.model || ''}</span>
       <span class="session-turns">${session.turns} turn${session.turns !== 1 ? 's' : ''}</span>
       ${costStr ? `<span class="session-cost">${costStr}</span>` : ''}
+      ${tokenHtml}
       ${contextHtml}
-      <button class="session-new-btn" title="Start new session">New</button>
     `;
     sessionBarEl.style.display = 'flex';
-
-    const newBtn = sessionBarEl.querySelector('.session-new-btn') as HTMLButtonElement;
-    newBtn.addEventListener('click', () => {
-      delete sessions[selectedTool];
-      messagesEl.innerHTML = '';
-      updateSessionBar();
-      showEmptyState(`New session. Using ${selectedTool} in ${config.cwd}`);
-    });
   } else {
     sessionBarEl.innerHTML = `<span class="session-none">New session — /help for commands</span>`;
     sessionBarEl.style.display = 'flex';
@@ -334,6 +408,10 @@ async function resumeSession(sessionId: string) {
     turns: 0,
     contextWindow: 0,
     contextUsed: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    cacheRead: 0,
+    cacheCreation: 0,
   };
   messagesEl.innerHTML = '';
 
@@ -359,6 +437,10 @@ async function resumeSession(sessionId: string) {
     const session = sessions[selectedTool];
     if (data.usage) {
       session.contextUsed = data.usage.contextUsed;
+      session.inputTokens = data.usage.inputTokens;
+      session.outputTokens = data.usage.outputTokens;
+      session.cacheRead = data.usage.cacheRead;
+      session.cacheCreation = data.usage.cacheCreation;
     }
     if (data.turns) {
       session.turns = data.turns;
@@ -383,14 +465,9 @@ async function resumeSession(sessionId: string) {
           content.textContent = ex.text;
         }
       }
-      const usageInfo = data.usage ? `, ${Math.round(data.usage.contextUsed / 1000)}k tokens` : '';
-      addSystemMessage(`Resumed session ${sessionId.slice(0, 8)}... — ${data.turns || 0} turns${usageInfo}`);
-    } else {
-      addSystemMessage(`Resumed session ${sessionId.slice(0, 8)}...`);
     }
   } catch {
     updateSessionBar();
-    addSystemMessage(`Resumed session ${sessionId.slice(0, 8)}...`);
   }
 }
 
@@ -478,6 +555,7 @@ async function runPrompt() {
         cwd: config.cwd,
         sessionId: currentSession?.id,
         model: currentModel || undefined,
+        permissionMode: selectedTool === 'claude' ? permissionMode : undefined,
       }),
     });
 
@@ -516,6 +594,10 @@ async function runPrompt() {
                 turns: 0,
                 contextWindow: data.session.contextWindow || 0,
                 contextUsed: 0,
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheRead: 0,
+                cacheCreation: 0,
               };
             } else {
               sessions[selectedTool].model = data.session.model || sessions[selectedTool].model;
@@ -539,6 +621,10 @@ async function runPrompt() {
               if (data.result.contextWindow) {
                 session.contextWindow = data.result.contextWindow;
               }
+              session.inputTokens = data.result.inputTokens || 0;
+              session.outputTokens = data.result.outputTokens || 0;
+              session.cacheRead = data.result.cacheRead || 0;
+              session.cacheCreation = data.result.cacheCreation || 0;
             }
             updateSessionBar();
             continue;
@@ -563,7 +649,7 @@ async function runPrompt() {
     aiMsg.classList.remove('streaming');
     isRunning = false;
     sendBtn.disabled = false;
-    sendBtn.textContent = 'Run';
+    updateRunButton();
   }
 }
 

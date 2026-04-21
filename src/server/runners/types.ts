@@ -3,6 +3,7 @@ import { ChildProcess } from 'child_process';
 export interface RunOptions {
   sessionId?: string;
   model?: string;
+  permissionMode?: 'auto' | 'plan';
 }
 
 export interface AIRunner {

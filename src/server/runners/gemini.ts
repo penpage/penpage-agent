@@ -15,8 +15,12 @@ export const geminiRunner: AIRunner = {
     }
   },
 
-  run(prompt: string, cwd: string, _options?: RunOptions): ChildProcess {
-    const child = spawn('gemini', ['-p', prompt], {
+  run(prompt: string, cwd: string, options?: RunOptions): ChildProcess {
+    const args = ['-p', prompt];
+    if (options?.model) {
+      args.push('--model', options.model);
+    }
+    const child = spawn('gemini', args, {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env },
