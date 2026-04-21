@@ -1,5 +1,5 @@
 import { spawn, execSync, ChildProcess } from 'child_process';
-import { AIRunner } from './types.js';
+import { AIRunner, RunOptions } from './types.js';
 
 export const geminiRunner: AIRunner = {
   name: 'gemini',
@@ -15,7 +15,7 @@ export const geminiRunner: AIRunner = {
     }
   },
 
-  run(prompt: string, cwd: string): ChildProcess {
+  run(prompt: string, cwd: string, _options?: RunOptions): ChildProcess {
     const child = spawn('gemini', ['-p', prompt], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],

@@ -1,5 +1,5 @@
 import { spawn, execSync, ChildProcess } from 'child_process';
-import { AIRunner } from './types.js';
+import { AIRunner, RunOptions } from './types.js';
 
 export const codexRunner: AIRunner = {
   name: 'codex',
@@ -15,7 +15,7 @@ export const codexRunner: AIRunner = {
     }
   },
 
-  run(prompt: string, cwd: string): ChildProcess {
+  run(prompt: string, cwd: string, _options?: RunOptions): ChildProcess {
     const child = spawn('codex', ['exec', '--skip-git-repo-check', prompt], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
