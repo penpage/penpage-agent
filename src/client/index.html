@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PenPage Agent</title>
+  <link rel="stylesheet" href="./styles/main.css">
+</head>
+<body>
+  <div id="app">
+    <header class="header">
+      <h1 class="logo">PenPage Agent</h1>
+      <div id="tool-selector" class="tool-selector"></div>
+    </header>
+    <main class="chat-area">
+      <div id="messages" class="messages"></div>
+    </main>
+    <footer class="input-area">
+      <textarea id="prompt-input" placeholder="Enter your prompt..." rows="3"></textarea>
+      <button id="send-btn" class="send-btn">Run</button>
+    </footer>
+  </div>
+  <script type="module" src="./app.ts"></script>
+</body>
+</html>
