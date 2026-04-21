@@ -6,6 +6,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { existsSync } from 'fs';
 import { aiRoutes } from './routes/ai.js';
+import { startWatcher } from './watcher.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -49,5 +50,9 @@ export async function createServer(port: number, projectCwd: string, dev = false
   }
 
   await app.listen({ port, host: '127.0.0.1' });
+
+  // Start file watcher for .claude/prompt/*.md
+  startWatcher(projectCwd);
+
   return app;
 }
