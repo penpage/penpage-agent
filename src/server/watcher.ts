@@ -1,5 +1,5 @@
 import { watch } from 'chokidar';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { join, basename } from 'path';
 import { getRunner } from './runners/index.js';
 
@@ -8,7 +8,14 @@ interface SessionMap {
 }
 
 const SESSIONS_FILE = '.sessions.json';
-let selfWriting = false;
+const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+
+// Per-file write tracking (replaces global boolean)
+const writingFiles = new Set<string>();
+
+// Processing queue
+const queue: string[] = [];
+let processing = false;
 
 function loadSessions(promptDir: string): SessionMap {
   const file = join(promptDir, SESSIONS_FILE);
@@ -24,6 +31,13 @@ function saveSessions(promptDir: string, sessions: SessionMap) {
   writeFileSync(file, JSON.stringify(sessions, null, 2));
 }
 
+function writeFile(filePath: string, content: string) {
+  writingFiles.add(filePath);
+  writeFileSync(filePath, content);
+  // Keep in set briefly to cover async event delivery
+  setTimeout(() => writingFiles.delete(filePath), 500);
+}
+
 function extractPrompt(content: string): string {
   // Find the last user section (after the last --- separator)
   const sections = content.split(/\n---\n/);
@@ -34,7 +48,27 @@ function extractPrompt(content: string): string {
   return lines.join('\n').trim();
 }
 
-async function handleFile(filePath: string, promptDir: string, cwd: string) {
+function processNext(promptDir: string, cwd: string) {
+  if (processing || queue.length === 0) return;
+
+  const filePath = queue.shift()!;
+  processing = true;
+
+  handleFile(filePath, promptDir, cwd).finally(() => {
+    processing = false;
+    processNext(promptDir, cwd);
+  });
+}
+
+function enqueue(filePath: string, promptDir: string, cwd: string) {
+  // Don't add duplicates
+  if (!queue.includes(filePath)) {
+    queue.push(filePath);
+  }
+  processNext(promptDir, cwd);
+}
+
+async function handleFile(filePath: string, promptDir: string, cwd: string): Promise<void> {
   let content: string;
   try {
     content = readFileSync(filePath, 'utf-8');
@@ -53,9 +87,7 @@ async function handleFile(filePath: string, promptDir: string, cwd: string) {
 
   // Replace trigger line with status
   lines[lines.length - 1] = statusLine;
-  selfWriting = true;
-  writeFileSync(filePath, lines.join('\n') + '\n');
-  selfWriting = false;
+  writeFile(filePath, lines.join('\n') + '\n');
 
   // Load session mapping
   const sessions = loadSessions(promptDir);
@@ -64,9 +96,7 @@ async function handleFile(filePath: string, promptDir: string, cwd: string) {
   // Extract only the latest user prompt
   const prompt = extractPrompt(content);
   if (!prompt) {
-    selfWriting = true;
-    writeFileSync(filePath, content.replace(statusLine, '/done (empty prompt)'));
-    selfWriting = false;
+    writeFile(filePath, content.replace(lastLine, '/done (empty prompt)'));
     return;
   }
 
@@ -75,6 +105,7 @@ async function handleFile(filePath: string, promptDir: string, cwd: string) {
   const runner = getRunner('claude');
   if (!runner) {
     console.log('  [watcher] Claude runner not found');
+    writeFile(filePath, content.replace(lastLine, '/error (no runner)'));
     return;
   }
 
@@ -84,70 +115,117 @@ async function handleFile(filePath: string, promptDir: string, cwd: string) {
     permissionMode: permissionMode as 'plan' | undefined,
   });
 
-  let responseText = '';
-  let newSessionId = '';
-  let stdoutBuffer = '';
+  return new Promise<void>((resolve) => {
+    let responseText = '';
+    let newSessionId = '';
+    let stdoutBuffer = '';
+    let finished = false;
 
-  child.stdout!.on('data', (chunk: Buffer) => {
-    stdoutBuffer += chunk.toString();
-    const jsonLines = stdoutBuffer.split('\n');
-    stdoutBuffer = jsonLines.pop() || '';
+    const finish = (error?: string) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
 
-    for (const line of jsonLines) {
-      if (!line.trim()) continue;
-      try {
-        const event = JSON.parse(line);
+      if (error) {
+        const currentContent = readFileSync(filePath, 'utf-8');
+        writeFile(filePath, currentContent.replace(statusLine, `/error (${error})`));
+        console.log(`  [watcher] ${filename}: error — ${error}`);
+        resolve();
+        return;
+      }
 
-        // Capture session ID from init event
-        if (event.type === 'system' && event.subtype === 'init') {
-          newSessionId = event.session_id || '';
-          continue;
-        }
+      // Save session mapping
+      if (newSessionId) {
+        sessions[filename] = newSessionId;
+        saveSessions(promptDir, sessions);
+      }
 
-        // Capture text from assistant message
-        if (event.type === 'assistant' && event.message?.content) {
-          for (const block of event.message.content) {
-            if (block.type === 'text') {
-              responseText += block.text;
-            }
+      // Append response to file
+      const currentContent = readFileSync(filePath, 'utf-8');
+      const updated = currentContent.replace(statusLine, '/done');
+
+      const output = responseText.trim()
+        ? `${updated}\n---\n\n**Claude (${mode}):**\n\n${responseText.trim()}\n`
+        : `${updated}\n---\n\n*No response.*\n`;
+
+      writeFile(filePath, output);
+      console.log(`  [watcher] ${filename}: done, ${responseText.length} chars`);
+      resolve();
+    };
+
+    // Timeout
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      finish('timeout');
+    }, TIMEOUT_MS);
+
+    child.stdout!.on('data', (chunk: Buffer) => {
+      stdoutBuffer += chunk.toString();
+      const jsonLines = stdoutBuffer.split('\n');
+      stdoutBuffer = jsonLines.pop() || '';
+
+      for (const line of jsonLines) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line);
+
+          if (event.type === 'system' && event.subtype === 'init') {
+            newSessionId = event.session_id || '';
+            continue;
           }
-          continue;
-        }
 
-        // Capture session ID from result
-        if (event.type === 'result' && event.session_id) {
-          newSessionId = event.session_id;
+          if (event.type === 'assistant' && event.message?.content) {
+            for (const block of event.message.content) {
+              if (block.type === 'text') {
+                responseText += block.text;
+              }
+            }
+            continue;
+          }
+
+          if (event.type === 'result' && event.session_id) {
+            newSessionId = event.session_id;
+          }
+        } catch {
+          // Skip malformed JSON
+        }
+      }
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0 && !responseText) {
+        finish(`exit code ${code}`);
+      } else {
+        finish();
+      }
+    });
+
+    child.on('error', (err) => {
+      finish(err.message);
+    });
+  });
+}
+
+function cleanupStuckFiles(promptDir: string) {
+  try {
+    const files = readdirSync(promptDir).filter((f) => f.endsWith('.md'));
+    for (const file of files) {
+      const filePath = join(promptDir, file);
+      try {
+        const content = readFileSync(filePath, 'utf-8');
+        const lastLine = content.trimEnd().split('\n').pop()?.trim();
+        if (lastLine === '/thinking...' || lastLine === '/running...') {
+          const updated = content.replace(lastLine, '/error (interrupted)');
+          writeFileSync(filePath, updated);
+          console.log(`  [watcher] Cleaned up stuck file: ${file}`);
         }
       } catch {
-        // Skip malformed JSON
+        // Skip unreadable files
       }
     }
-  });
-
-  child.on('close', () => {
-    // Save session mapping
-    if (newSessionId) {
-      sessions[filename] = newSessionId;
-      saveSessions(promptDir, sessions);
-    }
-
-    // Append response to file
-    const currentContent = readFileSync(filePath, 'utf-8');
-    const updated = currentContent.replace(
-      statusLine,
-      '/done'
-    );
-
-    const output = responseText.trim()
-      ? `${updated}\n---\n\n**Claude (${mode}):**\n\n${responseText.trim()}\n`
-      : `${updated}\n---\n\n*No response.*\n`;
-
-    selfWriting = true;
-    writeFileSync(filePath, output);
-    selfWriting = false;
-
-    console.log(`  [watcher] ${filename}: done, ${responseText.length} chars`);
-  });
+  } catch {
+    // Directory might not exist yet
+  }
 }
 
 export function startWatcher(cwd: string) {
@@ -158,6 +236,9 @@ export function startWatcher(cwd: string) {
     mkdirSync(promptDir, { recursive: true });
   }
 
+  // Clean up any stuck files from previous runs
+  cleanupStuckFiles(promptDir);
+
   const watcher = watch(promptDir, {
     ignoreInitial: true,
     usePolling: true,
@@ -165,11 +246,10 @@ export function startWatcher(cwd: string) {
     awaitWriteFinish: { stabilityThreshold: 300, pollInterval: 100 },
   });
 
-
   const onFileChange = (filePath: string) => {
-    if (selfWriting) return;
+    if (writingFiles.has(filePath)) return;
     if (!filePath.endsWith('.md')) return;
-    handleFile(filePath, promptDir, cwd);
+    enqueue(filePath, promptDir, cwd);
   };
 
   watcher.on('change', onFileChange);
