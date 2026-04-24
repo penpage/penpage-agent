@@ -3,6 +3,7 @@ import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 import { getAvailableRunners, getRunner } from '../runners/index.js';
+import { parseCommand, executeCommand, SessionData } from '../commands.js';
 
 export async function aiRoutes(app: FastifyInstance) {
   // List available AI tools
@@ -174,15 +175,37 @@ export async function aiRoutes(app: FastifyInstance) {
     }
   });
 
+  // Execute a slash command
+  app.post('/api/ai/command', async (request) => {
+    const { input, cwd, sessionData } = request.body as {
+      input: string;
+      cwd: string;
+      sessionData?: SessionData;
+    };
+
+    const parsed = parseCommand(input);
+    if (!parsed) return { handled: false };
+
+    const result = await executeCommand(parsed.name, parsed.args, {
+      cwd,
+      filename: 'web',
+      sessionData: sessionData || {},
+    });
+    if (!result) return { handled: false };
+
+    return { handled: true, ...result };
+  });
+
   // Run AI prompt with SSE streaming
   app.post('/api/ai/run', async (request, reply) => {
-    const { prompt, tool, cwd, sessionId, model, permissionMode } = request.body as {
+    const { prompt, tool, cwd, sessionId, model, permissionMode, addDirs } = request.body as {
       prompt: string;
       tool: string;
       cwd: string;
       sessionId?: string;
       model?: string;
       permissionMode?: 'auto' | 'plan';
+      addDirs?: string[];
     };
 
     if (!prompt || !tool || !cwd) {
@@ -205,7 +228,7 @@ export async function aiRoutes(app: FastifyInstance) {
       Connection: 'keep-alive',
     });
 
-    const child = runner.run(prompt, cwd, { sessionId, model, permissionMode });
+    const child = runner.run(prompt, cwd, { sessionId, model, permissionMode, addDirs });
 
     // Buffer for incomplete JSON lines
     let stdoutBuffer = '';

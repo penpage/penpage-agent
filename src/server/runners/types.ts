@@ -4,6 +4,7 @@ export interface RunOptions {
   sessionId?: string;
   model?: string;
   permissionMode?: 'auto' | 'plan';
+  addDirs?: string[];
 }
 
 export interface AIRunner {

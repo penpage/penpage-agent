@@ -51,7 +51,7 @@ export async function createServer(port: number, projectCwd: string, dev = false
 
   await app.listen({ port, host: '127.0.0.1' });
 
-  // Start file watcher for .claude/prompt/*.md
+  // Start file watcher for .penpage/*.md
   startWatcher(projectCwd);
 
   return app;

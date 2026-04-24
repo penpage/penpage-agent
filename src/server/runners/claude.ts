@@ -25,6 +25,13 @@ export const claudeRunner: AIRunner = {
     }
     if (options?.permissionMode === 'plan') {
       args.push('--permission-mode', 'plan');
+    } else {
+      args.push('--permission-mode', 'acceptEdits');
+    }
+    if (options?.addDirs) {
+      for (const dir of options.addDirs) {
+        args.push('--add-dir', dir);
+      }
     }
 
     const child = spawn('claude', args, {

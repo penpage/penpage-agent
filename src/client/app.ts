@@ -26,6 +26,7 @@ let isRunning = false;
 let config: Config = { cwd: '' };
 let currentModel: string = '';
 let permissionMode: 'auto' | 'plan' = 'plan';
+const addedDirs: string[] = [];
 
 const toolModels: Record<string, Array<{ value: string; label: string }>> = {
   claude: [
@@ -225,19 +226,19 @@ function addSystemMessage(text: string) {
   messagesEl.scrollTop = messagesEl.scrollHeight;
 }
 
-function handleCommand(input: string): boolean {
+function mdToHtml(md: string): string {
+  return md
+    .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+    .replace(/`(.+?)`/g, '<code>$1</code>')
+    .replace(/\n/g, '<br>');
+}
+
+async function handleCommand(input: string): Promise<boolean> {
   const parts = input.split(/\s+/);
   const cmd = parts[0].toLowerCase();
 
+  // Client-only commands
   switch (cmd) {
-    case '/clear': {
-      delete sessions[selectedTool];
-      messagesEl.innerHTML = '';
-      updateSessionBar();
-      showEmptyState(`New session. Using ${selectedTool} in ${config.cwd}`);
-      return true;
-    }
-
     case '/cost': {
       const session = sessions[selectedTool];
       if (session) {
@@ -253,111 +254,105 @@ function handleCommand(input: string): boolean {
       return true;
     }
 
-    case '/model': {
-      const modelName = parts[1];
-      if (!modelName) {
-        const session = sessions[selectedTool];
-        addSystemMessage(
-          `Current model: ${session?.model || 'default'}<br>` +
-          `Usage: <code>/model &lt;name&gt;</code><br>` +
-          `Examples: <code>/model sonnet</code>, <code>/model opus</code>, <code>/model haiku</code>`
-        );
-      } else {
-        currentModel = modelName;
-        addSystemMessage(`Model set to <b>${modelName}</b> for next prompt.`);
-      }
-      return true;
-    }
-
     case '/compact': {
       const session = sessions[selectedTool];
       if (!session) {
         addSystemMessage('No active session to compact.');
       } else {
-        // Send compact as a special prompt
         compactSession();
       }
       return true;
     }
-
-    case '/sessions': {
-      loadSessions();
-      return true;
-    }
-
-    case '/resume': {
-      const id = parts[1];
-      if (id) {
-        resumeSession(id);
-      } else {
-        loadSessions();
-      }
-      return true;
-    }
-
-    case '/help': {
-      addSystemMessage(
-        `<b>Commands:</b><br>` +
-        `<code>/clear</code> — Clear chat and start new session<br>` +
-        `<code>/cost</code> — Show session cost and usage<br>` +
-        `<code>/model [name]</code> — Show or change model (sonnet, opus, haiku)<br>` +
-        `<code>/compact</code> — Compact conversation context<br>` +
-        `<code>/sessions</code> — List recent sessions<br>` +
-        `<code>/resume [id]</code> — Resume a session (or pick from list)<br>` +
-        `<code>/help</code> — Show this help`
-      );
-      return true;
-    }
-
-    default:
-      return false;
   }
-}
 
-async function loadSessions() {
+  // Shared commands via server API
   try {
-    const res = await fetch(`/api/ai/sessions?cwd=${encodeURIComponent(config.cwd)}`);
-    const { sessions: list } = await res.json() as {
-      sessions: Array<{
-        sessionId: string;
-        name: string;
-        cwd: string;
-        startedAt: number;
-      }>;
+    const res = await fetch('/api/ai/command', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        input,
+        cwd: config.cwd,
+        sessionData: {
+          sessionId: sessions[selectedTool]?.id,
+          model: currentModel || undefined,
+          addDirs: addedDirs.length ? addedDirs : undefined,
+        },
+      }),
+    });
+    const data = await res.json() as {
+      handled: boolean;
+      markdown?: string;
+      sessionUpdate?: { sessionId?: string; model?: string; addDirs?: string[] };
+      sessionList?: Array<{ sessionId: string; name: string; startedAt: number }>;
     };
 
-    if (list.length === 0) {
-      addSystemMessage('No recent sessions found.');
-      return;
+    if (!data.handled) return false;
+
+    // Apply session state updates
+    if (data.sessionUpdate) {
+      if ('model' in data.sessionUpdate) {
+        currentModel = data.sessionUpdate.model || '';
+        updateRunButton();
+      }
+      if ('addDirs' in data.sessionUpdate) {
+        addedDirs.length = 0;
+        if (data.sessionUpdate.addDirs) {
+          addedDirs.push(...data.sessionUpdate.addDirs);
+        }
+      }
+      if ('sessionId' in data.sessionUpdate) {
+        if (data.sessionUpdate.sessionId) {
+          resumeSession(data.sessionUpdate.sessionId);
+          return true;
+        }
+      }
     }
 
-    const rows = list.map((s, i) => {
-      const date = new Date(s.startedAt);
-      const timeStr = date.toLocaleString();
-      const shortId = s.sessionId.slice(0, 8);
-      return `<div class="session-item" data-session-id="${s.sessionId}">` +
-        `<span class="session-item-index">${i + 1}.</span> ` +
-        `<span class="session-item-name">${s.name || 'unnamed'}</span> ` +
-        `<span class="session-item-id">${shortId}</span> ` +
-        `<span class="session-item-time">${timeStr}</span>` +
-        `</div>`;
-    }).join('');
+    // Handle /clear — also clear client-side state
+    if (cmd === '/clear') {
+      delete sessions[selectedTool];
+      messagesEl.innerHTML = '';
+      updateSessionBar();
+      showEmptyState(`New session. Using ${selectedTool} in ${config.cwd}`);
+      return true;
+    }
 
-    addSystemMessage(
-      `<b>Recent sessions</b> (click to resume):<br>${rows}`
-    );
+    // Handle /sessions — render clickable list
+    if (data.sessionList && data.sessionList.length > 0) {
+      const rows = data.sessionList.map((s, i) => {
+        const date = new Date(s.startedAt);
+        const timeStr = date.toLocaleString();
+        const shortId = s.sessionId.slice(0, 8);
+        return `<div class="session-item" data-session-id="${s.sessionId}">` +
+          `<span class="session-item-index">${i + 1}.</span> ` +
+          `<span class="session-item-name">${s.name || 'unnamed'}</span> ` +
+          `<span class="session-item-id">${shortId}</span> ` +
+          `<span class="session-item-time">${timeStr}</span>` +
+          `</div>`;
+      }).join('');
 
-    // Add click handlers — show preview first
-    const items = messagesEl.querySelectorAll('.session-item');
-    items.forEach((item) => {
-      (item as HTMLElement).style.cursor = 'pointer';
-      item.addEventListener('click', () => {
-        const id = (item as HTMLElement).dataset.sessionId!;
-        previewSession(id);
+      addSystemMessage(`<b>Recent sessions</b> (click to resume):<br>${rows}`);
+
+      // Add click handlers
+      const items = messagesEl.querySelectorAll('.session-item');
+      items.forEach((item) => {
+        (item as HTMLElement).style.cursor = 'pointer';
+        item.addEventListener('click', () => {
+          const id = (item as HTMLElement).dataset.sessionId!;
+          previewSession(id);
+        });
       });
-    });
+      return true;
+    }
+
+    // Default: render markdown as HTML
+    if (data.markdown) {
+      addSystemMessage(mdToHtml(data.markdown));
+    }
+    return true;
   } catch {
-    addSystemMessage('Failed to load sessions.');
+    return false;
   }
 }
 
@@ -521,7 +516,7 @@ async function runPrompt() {
   if (prompt.startsWith('/')) {
     promptInput.value = '';
     promptInput.style.height = 'auto';
-    if (handleCommand(prompt)) return;
+    if (await handleCommand(prompt)) return;
     // Unknown command, send as regular prompt
   }
 
@@ -556,6 +551,7 @@ async function runPrompt() {
         sessionId: currentSession?.id,
         model: currentModel || undefined,
         permissionMode: selectedTool === 'claude' ? permissionMode : undefined,
+        addDirs: addedDirs.length > 0 ? addedDirs : undefined,
       }),
     });
 
