@@ -14,12 +14,11 @@ export interface SessionDisplayData {
 
 export function formatSessionLine(data: SessionDisplayData): string {
   const parts: string[] = [];
-  if (data.session) parts.push(data.session.slice(0, 8));
-  parts.push(data.model || 'claude');
+  parts.push((data.model || 'claude') + ':');
   const t = data.turns || 0;
   parts.push(`${t} ${t === 1 ? 'turn' : 'turns'}`);
-  if (data.runCost !== undefined) parts.push(`$${data.runCost.toFixed(4)}`);
-  parts.push(`total:$${(data.totalCost || 0).toFixed(4)}`);
+  if (data.runCost !== undefined) parts.push(`$ ${data.runCost.toFixed(4)}`);
+  parts.push(`total: $ ${(data.totalCost || 0).toFixed(4)}`);
   if (data.inputTokens || data.outputTokens) {
     const inK = ((data.inputTokens || 0) / 1000).toFixed(1);
     const outK = ((data.outputTokens || 0) / 1000).toFixed(1);

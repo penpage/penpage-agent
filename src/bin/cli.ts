@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
+import 'dotenv/config';
 import { createServer } from '../server/index.js';
+import { startTelegramBot } from '../telegram/bot.js';
 import open from 'open';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -56,6 +58,12 @@ async function main() {
     const url = `http://127.0.0.1:${port}`;
     console.log(`  Server:  ${url}`);
     console.log(`\n  Press Ctrl+C to stop\n`);
+    // 啟動 Telegram Bot（有 BOT_TOKEN 才啟動）
+    const bot = startTelegramBot();
+    if (!bot) {
+      console.log('  Telegram: 未設定 BOT_TOKEN，跳過');
+    }
+
     if (!dev) {
       await open(url);
     }

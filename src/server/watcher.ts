@@ -1,5 +1,5 @@
 import { watch } from 'chokidar';
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, truncateSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { join, basename } from 'path';
 import { getRunner } from './runners/index.js';
 import { parseCommand, executeCommand, SessionData } from './commands.js';
@@ -9,7 +9,7 @@ interface SessionMap {
   [filename: string]: SessionData;
 }
 
-const BUILD_TAG = '20260424f'; // 每次修改時更新
+const BUILD_TAG = '20260427b'; // 每次修改時更新
 const SESSIONS_FILE = '.sessions.json';
 const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -42,14 +42,48 @@ function shortTime(): string {
   return new Date().toTimeString().slice(0, 8);
 }
 
+/** mm-dd hh:mm:ss 格式，用於 code block 行首 */
+function shortDateTime(): string {
+  const d = new Date();
+  const mm = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  const time = d.toTimeString().slice(0, 8);
+  return `${mm}-${dd} ${time}`;
+}
+
+const LOG_FILE = '/tmp/penpage-agent.log';
+
 function log(file: string, arrow: string, msg: string) {
-  console.log(`  ${shortTime()}  ${file} ${arrow} ${msg}`);
+  const line = `  ${shortTime()}  ${file} ${arrow} ${msg}`;
+  console.log(line);
+  try { appendFileSync(LOG_FILE, line + '\n'); } catch { /* ignore */ }
 }
 
 function writeFile(filePath: string, content: string) {
   writingFiles.add(filePath);
   writeFileSync(filePath, content);
   setTimeout(() => writingFiles.delete(filePath), 500);
+}
+
+/** Append-only 寫入，不修改既有內容 */
+function appendToFile(filePath: string, content: string) {
+  writingFiles.add(filePath);
+  appendFileSync(filePath, content);
+  setTimeout(() => writingFiles.delete(filePath), 500);
+}
+
+/** 若檔案以 \n```\n 結尾，移除最後的 ```\n 並回傳 true */
+function removeClosingFence(filePath: string): boolean {
+  const buf = readFileSync(filePath);
+  if (buf.length < 5) return false;
+  // 檢查尾部 4 bytes 是 ```\n，且前面有 \n
+  if (buf[buf.length - 4] === 0x60 && buf[buf.length - 3] === 0x60
+    && buf[buf.length - 2] === 0x60 && buf[buf.length - 1] === 0x0a
+    && buf[buf.length - 5] === 0x0a) {
+    truncateSync(filePath, buf.length - 4); // 移除 ```\n，保留前面的 \n
+    return true;
+  }
+  return false;
 }
 
 
@@ -112,7 +146,7 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
   const cmd = getLastCommand(content);
   if (!cmd) return;
 
-  const { lastLine, contentLines, hasTrailingNewline } = cmd;
+  const { lastLine, hasTrailingNewline } = cmd;
 
   // Check for shared commands (/model, /help, /resume, etc.)
   const parsed = parseCommand(lastLine);
@@ -132,6 +166,7 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
       const mergedRunner = merged.runner || 'claude';
       const mergedModelDisplay = merged.model ? `${mergedRunner} - ${merged.model}` : mergedRunner;
       const cmdLine = `/${parsed.name}${parsed.args.length ? ' ' + parsed.args.join(' ') : ''}`;
+      const ts = shortDateTime();
       const info = formatSessionLine({
         model: mergedModelDisplay,
         session: merged.sessionId,
@@ -139,11 +174,12 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
         totalCost: merged.totalCost,
         completed: formatTime(),
       });
-      contentLines.pop(); // 移除 command 行
-      const cmdOutput = contentLines.join('\n') + `\n\n\`\`\`\n${cmdLine}\n${info}\n\`\`\`\n\n${result.markdown}\n\n---\n`;
+      // Append-only：只追加，不修改既有內容
+      const cmdSid = merged.sessionId ? `${merged.sessionId.slice(0, 7)} ` : '';
+      const appendContent = `\n\n\`\`\`\n${ts} - ${cmdSid}Command: ${cmdLine}\n${ts} - ${info}\n\`\`\`\n\n${result.markdown}\n\n---\n`;
       log(filename, '→', cmdLine);
-      writeFile(filePath, cmdOutput);
-      log(filename, '←', `${cmdOutput.split('\n').length} lines, ok`);
+      appendToFile(filePath, appendContent);
+      log(filename, '←', 'ok');
       return;
     }
   }
@@ -152,7 +188,7 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
   if (lastLine !== '/plan' && lastLine !== '/run') return;
 
   const mode = lastLine === '/plan' ? 'plan' : 'auto';
-  const statusLine = mode === 'plan' ? '/thinking...' : '/running...';
+  const cmdLabel = mode === 'plan' ? '/plan' : '/run';
 
   // Load session mapping
   const sessions = loadSessions(promptDir);
@@ -161,31 +197,22 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
   const selectedModel = sessions[filename]?.model;
   const addDirs = sessions[filename]?.addDirs;
 
-  // Replace trigger line with status + code block
-  const startTime = formatTime();
-  const modelDisplay = selectedModel ? `${selectedRunner} - ${selectedModel}` : selectedRunner;
-  const startInfo = formatSessionLine({
-    model: modelDisplay,
-    session: sessionId,
-    started: startTime,
-  });
-  contentLines[contentLines.length - 1] = statusLine;
-  writeFile(filePath, contentLines.join('\n') + `\n\n\`\`\`\n${startInfo}\n\`\`\`\n`);
-
-  // Extract only the latest user prompt
+  // Extract prompt 在 append 之前（使用原始 content）
   const prompt = extractPrompt(content);
-  if (!prompt) {
-    contentLines.pop(); // 移除 status line
-    writeFile(filePath, contentLines.join('\n') + '\n');
-    return;
-  }
+  if (!prompt) return;
 
-  log(filename, '→', `/${mode === 'plan' ? 'plan' : 'run'} ${prompt.slice(0, 60)}...`);
+  // Append-only：追加 command code block，不修改既有內容
+  const startTime = formatTime();
+  const startTs = shortDateTime();
+  const modelDisplay = selectedModel ? `${selectedRunner} - ${selectedModel}` : selectedRunner;
+  const sidTag = sessionId ? `${sessionId.slice(0, 7)} ` : '';
+  appendToFile(filePath, `\n\n\`\`\`\n${startTs} - ${sidTag}Command: ${cmdLabel}\n\`\`\`\n`);
+
+  log(filename, '→', `${cmdLabel} ${prompt.slice(0, 60)}...`);
 
   const runner = getRunner(selectedRunner);
   if (!runner) {
-    contentLines[contentLines.length - 1] = '/error (no runner)';
-    writeFile(filePath, contentLines.join('\n') + '\n');
+    appendToFile(filePath, `\n\n*Error: runner "${selectedRunner}" not found.*\n\n---\n`);
     log(filename, '←', `error: runner "${selectedRunner}" not found`);
     return;
   }
@@ -216,8 +243,14 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
       clearTimeout(timer);
 
       if (error) {
-        const currentContent = readFileSync(filePath, 'utf-8');
-        writeFile(filePath, currentContent.replace(statusLine, `/error (${error})`));
+        // 合併到同一個 code block：移除 closing fence 再 append
+        const errTs = shortDateTime();
+        writingFiles.add(filePath);
+        const merged = removeClosingFence(filePath);
+        appendFileSync(filePath, merged
+          ? `${errTs} - error: ${error}\n\`\`\`\n\n---\n`
+          : `\n\n\`\`\`\n${errTs} - error: ${error}\n\`\`\`\n\n---\n`);
+        setTimeout(() => writingFiles.delete(filePath), 500);
         log(filename, '←', `error: ${error}`);
         resolve();
         return;
@@ -236,9 +269,9 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
       sessions[filename] = updated_session;
       saveSessions(promptDir, sessions);
 
-      // 用完整 session info 替換 code block，移除 status line
-      const currentContent = readFileSync(filePath, 'utf-8');
+      // Append-only：追加 result code block + AI 回應 + 分隔線
       const endTime = formatTime();
+      const endTs = shortDateTime();
       const finishInfo = formatSessionLine({
         model: actualModel || modelDisplay,
         session: newSessionId || sessionId,
@@ -251,16 +284,17 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
         started: startTime,
         completed: endTime,
       });
-      // 移除 status line（/thinking... 或 /running...）並替換 code block
-      let updated = currentContent.replace(statusLine + '\n', '');
-      updated = updated.replace(/```\n[\s\S]*?\n```/, `\`\`\`\n${finishInfo}\n\`\`\``);
 
-      const output = responseText.trim()
-        ? `${updated}\n\n${responseText.trim()}\n\n---\n`
-        : `${updated}\n\n*No response.*\n\n---\n`;
-
-      writeFile(filePath, output);
-      log(filename, '←', `${output.split('\n').length} lines, ok`);
+      // 合併到同一個 code block：移除 closing fence 再 append
+      const response = responseText.trim() || '*No response.*';
+      writingFiles.add(filePath);
+      const merged = removeClosingFence(filePath);
+      appendFileSync(filePath, merged
+        ? `${endTs} - ${finishInfo}\n\`\`\`\n\n${response}\n\n---\n`
+        : `\n\n\`\`\`\n${endTs} - ${finishInfo}\n\`\`\`\n\n${response}\n\n---\n`);
+      setTimeout(() => writingFiles.delete(filePath), 500);
+      const lines = response.split('\n').length;
+      log(filename, '←', `${lines} lines, ok`);
       resolve();
     };
 
@@ -351,28 +385,9 @@ function scanPendingFiles(promptDir: string, cwd: string) {
   }
 }
 
-function cleanupStuckFiles(promptDir: string) {
-  try {
-    const files = readdirSync(promptDir).filter((f) => f.endsWith('.md'));
-    for (const file of files) {
-      const filePath = join(promptDir, file);
-      try {
-        const content = readFileSync(filePath, 'utf-8');
-        // 偵測 stuck 狀態（不需要尾部換行確認）
-        if (content.includes('/thinking...') || content.includes('/running...')) {
-          const updated = content
-            .replace('/thinking...', '/error (interrupted)')
-            .replace('/running...', '/error (interrupted)');
-          writeFileSync(filePath, updated);
-          log(file, '←', 'cleanup: interrupted');
-        }
-      } catch {
-        // Skip unreadable files
-      }
-    }
-  } catch {
-    // Directory might not exist yet
-  }
+function cleanupStuckFiles(_promptDir: string) {
+  // Append-only 模式不需要清理 stuck 狀態
+  // 舊的 /thinking... /running... 不再使用
 }
 
 export function startWatcher(cwd: string) {
@@ -411,7 +426,11 @@ export function startWatcher(cwd: string) {
   watcher.on('change', onFileChange);
   watcher.on('add', onFileChange);
 
-  console.log(`  Watcher: ${promptDir} [${BUILD_TAG}]`);
+  const startMsg = `  ${shortTime()}  Watcher started [${BUILD_TAG}]`;
+  const logMsg = `  ${shortTime()}  Log: ${LOG_FILE}`;
+  console.log(startMsg);
+  console.log(logMsg);
+  try { appendFileSync(LOG_FILE, '\n' + startMsg + '\n'); } catch { /* ignore */ }
 
   return watcher;
 }
