@@ -1,7 +1,8 @@
-import { readdirSync, readFileSync } from 'fs';
+import { readdirSync, readFileSync, existsSync, statSync } from 'fs';
 import { execSync, exec } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
+import { formatSessionLine } from '../shared/formatSession.js';
 
 // --- Types ---
 
@@ -22,6 +23,8 @@ export interface SessionData {
   totalOutputTokens?: number;
   /** 對話紀錄，用於 session 失效時重建 context */
   messages?: ChatMessage[];
+  /** Telegram/WebUI: 當前目標 md file（如 '05-04 指令.md'） */
+  targetPage?: string;
 }
 
 export interface CommandContext {
@@ -56,6 +59,7 @@ const COMMAND_DEFS: CommandDef[] = [
   { name: 'new', description: 'Start new session (keep model/dirs)', usage: '/new' },
   { name: 'clear', description: 'Clear all session data', usage: '/clear' },
   { name: 'history', description: 'Show conversation history', usage: '/history [N]' },
+  { name: 'page', description: 'List pages or switch target', usage: '/page [N|name|info]' },
   { name: 'ping', description: 'Ping test', usage: '/ping' },
   { name: 'uptime', description: 'System uptime', usage: '/uptime' },
   { name: 'df', description: 'Disk usage', usage: '/df' },
@@ -133,6 +137,8 @@ export async function executeCommand(
       return handleClear();
     case 'history':
       return handleHistory(args, ctx);
+    case 'page':
+      return handlePage(args, ctx);
     case 'ping':
     case 'uptime':
     case 'df':
@@ -427,6 +433,124 @@ function handleHistory(args: string[], ctx: CommandContext): CommandResult {
     return `${label} ${preview}`;
   });
   return { markdown: `**History** (${messages.length} messages):\n\n${lines.join('\n\n')}` };
+}
+
+function formatPageInfo(filename: string, s: SessionData | undefined): string {
+  const name = filename.replace(/\.md$/, '');
+  if (!s) return `**${name}** — no session`;
+  const parts: string[] = [`**${name}**`];
+  const sid = s.sessionId ? s.sessionId.slice(0, 8) : '-';
+  const turns = s.totalTurns || 0;
+  const cost = (s.totalCost || 0).toFixed(4);
+  parts.push(`${sid} | ${turns} turns | $${cost}`);
+  if (s.totalInputTokens || s.totalOutputTokens) {
+    const inK = ((s.totalInputTokens || 0) / 1000).toFixed(1);
+    const outK = ((s.totalOutputTokens || 0) / 1000).toFixed(1);
+    parts[1] += ` | ${inK}k/${outK}k`;
+  }
+  if (s.addDirs?.length) parts.push(`dirs: ${s.addDirs.join(', ')}`);
+  return parts.join('\n');
+}
+
+function handlePage(args: string[], ctx: CommandContext): CommandResult {
+  const promptDir = join(ctx.cwd, '.penpage');
+  if (!existsSync(promptDir)) {
+    return { markdown: 'No .penpage directory found.' };
+  }
+
+  // 依修改時間排序（最近的在前）
+  const files = readdirSync(promptDir)
+    .filter(f => f.endsWith('.md'))
+    .map(f => ({ name: f, mtime: statSync(join(promptDir, f)).mtimeMs }))
+    .sort((a, b) => b.mtime - a.mtime)
+    .map(f => f.name);
+  if (files.length === 0) {
+    return { markdown: 'No pages found in .penpage/' };
+  }
+
+  const arg = args.join(' ').trim();
+
+  // /page → 簡潔列表（只顯示編號 + 名稱 + ★ 標記）
+  if (!arg) {
+    const currentTarget = ctx.sessionData.targetPage || null;
+    const lines = files.map((f, i) => {
+      const mark = f === currentTarget ? '★' : ' ';
+      const name = f.replace(/\.md$/, '');
+      return `${mark}${i + 1}. ${name}`;
+    });
+    const header = currentTarget
+      ? `**Current:** ${currentTarget.replace(/\.md$/, '')}`
+      : '**Current:** (default)';
+    return { markdown: `${header}\n\n${lines.join('\n')}` };
+  }
+
+  // /page info [N] → 詳細資訊
+  if (args[0]?.toLowerCase() === 'info') {
+    const sessions = loadFileSessions(promptDir);
+
+    if (args[1] && /^\d+$/.test(args[1])) {
+      // /page info N → 指定 page
+      const idx = parseInt(args[1]) - 1;
+      if (idx < 0 || idx >= files.length) {
+        return { markdown: `Invalid number (1-${files.length}). Use \`/page\` to see list.` };
+      }
+      const f = files[idx];
+      return { markdown: formatPageInfo(f, sessions[f]) };
+    }
+
+    // /page info → 所有 pages 的詳細資訊
+    const currentTarget = ctx.sessionData.targetPage || null;
+    const blocks = files.map((f, i) => {
+      const mark = f === currentTarget ? '★' : ' ';
+      return `${mark}${i + 1}. ${formatPageInfo(f, sessions[f])}`;
+    });
+    return { markdown: blocks.join('\n\n') };
+  }
+
+  // 特殊：切回預設
+  if (arg === 'default' || arg === 'reset') {
+    return {
+      markdown: 'Switched to default page.',
+      sessionUpdate: { targetPage: undefined },
+    };
+  }
+
+  // /page N → 數字選擇
+  if (/^\d+$/.test(arg)) {
+    const idx = parseInt(arg) - 1;
+    if (idx >= 0 && idx < files.length) {
+      const target = files[idx];
+      return {
+        markdown: `Switched to: **${target.replace(/\.md$/, '')}**`,
+        sessionUpdate: { targetPage: target },
+      };
+    }
+    return { markdown: `Invalid number (1-${files.length}). Use \`/page\` to see list.` };
+  }
+
+  // /page X → 模糊比對
+  const query = arg.toLowerCase();
+  const target = files.find(f => f.toLowerCase().replace(/\.md$/, '').includes(query))
+    || files.find(f => f.toLowerCase().includes(query));
+  if (!target) {
+    return { markdown: `Page not found: ${arg}\nUse \`/page\` to list available pages.` };
+  }
+
+  return {
+    markdown: `Switched to: **${target.replace(/\.md$/, '')}**`,
+    sessionUpdate: { targetPage: target },
+  };
+}
+
+/** 讀取 .sessions.json（file watcher 的 session mapping） */
+function loadFileSessions(promptDir: string): Record<string, SessionData> {
+  try {
+    const file = join(promptDir, '.sessions.json');
+    if (existsSync(file)) {
+      return JSON.parse(readFileSync(file, 'utf-8'));
+    }
+  } catch {}
+  return {};
 }
 
 function handleShell(name: string): CommandResult {

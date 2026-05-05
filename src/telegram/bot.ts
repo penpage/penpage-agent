@@ -73,8 +73,33 @@ function shortDateTime(): string {
   return `${mm}-${dd} ${time}`;
 }
 
-/** 取得 chat 對應的 .md 檔名 */
-function getMdFilename(chat: { id: number; type: string; title?: string }): string {
+const FILE_SESSIONS = '.sessions.json';
+
+/** 讀取 .sessions.json（file watcher 的 session mapping） */
+function loadFileSessions(promptDir: string): Record<string, any> {
+  try {
+    const file = join(promptDir, FILE_SESSIONS);
+    if (existsSync(file)) {
+      return JSON.parse(readFileSync(file, 'utf-8'));
+    }
+  } catch {}
+  return {};
+}
+
+/** 更新 .sessions.json 的特定 entry */
+function updateFileSession(promptDir: string, filename: string, data: Partial<SessionData>): void {
+  const sessions = loadFileSessions(promptDir);
+  sessions[filename] = { ...sessions[filename], ...data };
+  try {
+    writeFileSync(join(promptDir, FILE_SESSIONS), JSON.stringify(sessions, null, 2));
+  } catch {}
+}
+
+/** 取得 chat 對應的 .md 檔名（支援 /page 切換目標） */
+function getMdFilename(chat: { id: number; type: string; title?: string }, sessionData?: SessionData): string {
+  // 如果有指定 targetPage，用它
+  if (sessionData?.targetPage) return sessionData.targetPage;
+  // 預設：private → telegram.md, group → tg-{name}.md
   if (chat.type === 'private') return 'telegram.md';
   const name = (chat.title || String(chat.id)).replace(/[\/\\:*?"<>|]/g, '_');
   return `tg-${name}.md`;
@@ -249,7 +274,17 @@ export function startTelegramBot(cwd: string) {
     const startTime = shortDateTime();
 
     // 送出「思考中」訊息，後續用 editMessageText 更新進度
-    const statusMsg = await ctx.reply('⏳ Thinking...');
+    const mdFile = getMdFilename(ctx.chat!, sessionData);
+    const statusMsg = await ctx.reply(`⏳ Thinking... → ${mdFile}`);
+
+    // 如果目標是特定 page（非預設），載入該 page 的 file session（共用 sessionId）
+    if (sessionData.targetPage) {
+      const fileSessions = loadFileSessions(promptDir);
+      const fileSession = fileSessions[sessionData.targetPage];
+      if (fileSession?.sessionId && !sessionData.sessionId) {
+        sessionData.sessionId = fileSession.sessionId;
+      }
+    }
 
     // 初始化對話紀錄
     if (!sessionData.messages) sessionData.messages = [];
@@ -359,7 +394,6 @@ export function startTelegramBot(cwd: string) {
     }
 
     // 寫入 .penpage/*.md 完整對話紀錄
-    const mdFile = getMdFilename(ctx.chat!);
     const mdPath = join(promptDir, mdFile);
     const endTime = shortDateTime();
     const sid = sessionData.sessionId ? sessionData.sessionId.slice(0, 7) + ' ' : '';
@@ -384,6 +418,20 @@ export function startTelegramBot(cwd: string) {
       console.log(`  📝 Written to ${mdFile} (${block.length} chars)`);
     } catch (writeErr: any) {
       console.error(`  ❌ Failed to write ${mdPath}: ${writeErr.message}`);
+    }
+
+    // 如果目標是特定 page，同步更新 .sessions.json（讓 file watcher / PenPage 看到）
+    if (sessionData.targetPage) {
+      updateFileSession(promptDir, sessionData.targetPage, {
+        sessionId: sessionData.sessionId,
+        runner: sessionData.runner,
+        model: sessionData.model,
+        addDirs: sessionData.addDirs,
+        totalCost: sessionData.totalCost,
+        totalTurns: sessionData.totalTurns,
+        totalInputTokens: sessionData.totalInputTokens,
+        totalOutputTokens: sessionData.totalOutputTokens,
+      });
     }
   }
 
