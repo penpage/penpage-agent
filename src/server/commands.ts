@@ -1,9 +1,15 @@
 import { readdirSync, readFileSync } from 'fs';
-import { execSync } from 'child_process';
+import { execSync, exec } from 'child_process';
 import { join } from 'path';
 import { homedir } from 'os';
 
 // --- Types ---
+
+export interface ChatMessage {
+  role: 'user' | 'assistant';
+  content: string;
+  timestamp: number;
+}
 
 export interface SessionData {
   sessionId?: string;
@@ -14,6 +20,8 @@ export interface SessionData {
   totalTurns?: number;
   totalInputTokens?: number;
   totalOutputTokens?: number;
+  /** 對話紀錄，用於 session 失效時重建 context */
+  messages?: ChatMessage[];
 }
 
 export interface CommandContext {
@@ -45,8 +53,25 @@ const COMMAND_DEFS: CommandDef[] = [
   { name: 'resume', description: 'List sessions or resume one', usage: '/resume [id|N]' },
   { name: 'add-dir', description: 'Add directory access', usage: '/add-dir <path>' },
   { name: 'dirs', description: 'List directories', usage: '/dirs' },
-  { name: 'clear', description: 'Clear session', usage: '/clear' },
+  { name: 'new', description: 'Start new session (keep model/dirs)', usage: '/new' },
+  { name: 'clear', description: 'Clear all session data', usage: '/clear' },
+  { name: 'history', description: 'Show conversation history', usage: '/history [N]' },
+  { name: 'ping', description: 'Ping test', usage: '/ping' },
+  { name: 'uptime', description: 'System uptime', usage: '/uptime' },
+  { name: 'df', description: 'Disk usage', usage: '/df' },
+  { name: 'who', description: 'Current user & hostname', usage: '/who' },
+  { name: 'ip', description: 'External IP address', usage: '/ip' },
+  { name: 'mem', description: 'Memory info', usage: '/mem' },
 ];
+
+const SHELL_COMMANDS: Record<string, string> = {
+  ping: 'echo pong',
+  uptime: 'uptime',
+  df: 'df -h',
+  who: 'whoami && hostname',
+  ip: 'curl -s ifconfig.me',
+  mem: 'top -l 1 -s 0 | head -n 10',
+};
 
 export const AVAILABLE_MODELS = [
   { value: '', runner: 'claude', label: 'Claude' },
@@ -102,8 +127,19 @@ export async function executeCommand(
       return handleAddDir(args, ctx);
     case 'dirs':
       return handleDirs(ctx);
+    case 'new':
+      return handleNew(ctx);
     case 'clear':
       return handleClear();
+    case 'history':
+      return handleHistory(args, ctx);
+    case 'ping':
+    case 'uptime':
+    case 'df':
+    case 'who':
+    case 'ip':
+    case 'mem':
+      return handleShell(name);
     default:
       return null;
   }
@@ -341,9 +377,65 @@ function handleDirs(ctx: CommandContext): CommandResult {
   return { markdown: `**Project:** \`${ctx.cwd}\`\n**Additional dirs:**\n${list}` };
 }
 
+function handleNew(ctx: CommandContext): CommandResult {
+  const oldSid = ctx.sessionData.sessionId;
+  const oldTurns = ctx.sessionData.totalTurns || 0;
+  const kept: string[] = [];
+  if (ctx.sessionData.model) kept.push(`model: ${ctx.sessionData.model}`);
+  if (ctx.sessionData.addDirs?.length) kept.push(`dirs: ${ctx.sessionData.addDirs.length}`);
+  const keptInfo = kept.length > 0 ? `\nKept: ${kept.join(', ')}` : '';
+  const oldInfo = oldSid ? ` (was ${oldSid.slice(0, 7)}, ${oldTurns} turns)` : '';
+  return {
+    markdown: `New session started${oldInfo}.${keptInfo}`,
+    sessionUpdate: {
+      sessionId: undefined,
+      totalCost: 0,
+      totalTurns: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      messages: [],
+    },
+  };
+}
+
 function handleClear(): CommandResult {
   return {
-    markdown: 'Session cleared.',
-    sessionUpdate: { sessionId: undefined, model: undefined, addDirs: undefined },
+    markdown: 'Session cleared (all settings reset).',
+    sessionUpdate: {
+      sessionId: undefined,
+      model: undefined,
+      addDirs: undefined,
+      totalCost: 0,
+      totalTurns: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      messages: [],
+    },
   };
+}
+
+function handleHistory(args: string[], ctx: CommandContext): CommandResult {
+  const messages = ctx.sessionData.messages || [];
+  if (messages.length === 0) {
+    return { markdown: 'No conversation history.' };
+  }
+  const count = args[0] ? Math.min(parseInt(args[0]) * 2, messages.length) : messages.length;
+  const recent = messages.slice(-count);
+  const lines = recent.map((m) => {
+    const label = m.role === 'user' ? '👤' : '🤖';
+    const preview = m.content.length > 200 ? m.content.slice(0, 200) + '...' : m.content;
+    return `${label} ${preview}`;
+  });
+  return { markdown: `**History** (${messages.length} messages):\n\n${lines.join('\n\n')}` };
+}
+
+function handleShell(name: string): CommandResult {
+  const shell = SHELL_COMMANDS[name];
+  if (!shell) return { markdown: `Unknown shell command: ${name}` };
+  try {
+    const output = execSync(shell, { timeout: 30000, encoding: 'utf-8' }).trim();
+    return { markdown: output || '(no output)' };
+  } catch (err: any) {
+    return { markdown: `Error: ${err.message}` };
+  }
 }

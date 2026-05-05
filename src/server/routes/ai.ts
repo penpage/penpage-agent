@@ -2,7 +2,8 @@ import { FastifyInstance } from 'fastify';
 import { readdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
-import { getAvailableRunners, getRunner } from '../runners/index.js';
+import { getAvailableRunners } from '../runners/index.js';
+import { runPrompt } from '../runners/execute.js';
 import { parseCommand, executeCommand, SessionData } from '../commands.js';
 
 export async function aiRoutes(app: FastifyInstance) {
@@ -212,127 +213,32 @@ export async function aiRoutes(app: FastifyInstance) {
       return reply.code(400).send({ error: 'Missing prompt, tool, or cwd' });
     }
 
-    const runner = getRunner(tool);
-    if (!runner) {
-      return reply.code(400).send({ error: `Unknown tool: ${tool}` });
-    }
-
-    const available = await runner.isAvailable();
-    if (!available) {
-      return reply.code(400).send({ error: `${tool} CLI is not installed` });
-    }
-
     reply.raw.writeHead(200, {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
     });
 
-    const child = runner.run(prompt, cwd, { sessionId, model, permissionMode, addDirs });
+    try {
+      const { child } = runPrompt(tool, prompt, cwd, { sessionId, model, permissionMode, addDirs }, {
+        onText: (text) => reply.raw.write(`data: ${JSON.stringify({ text })}\n\n`),
+        onSession: (session) => reply.raw.write(`data: ${JSON.stringify({ session })}\n\n`),
+        onResult: (result) => reply.raw.write(`data: ${JSON.stringify({ result })}\n\n`),
+        onError: (error) => reply.raw.write(`data: ${JSON.stringify({ error })}\n\n`),
+      });
 
-    // Buffer for incomplete JSON lines
-    let stdoutBuffer = '';
+      child.on('close', (code: number | null) => {
+        reply.raw.write(`data: ${JSON.stringify({ done: true, exitCode: code })}\n\n`);
+        reply.raw.end();
+      });
 
-    child.stdout!.on('data', (chunk: Buffer) => {
-      stdoutBuffer += chunk.toString();
-      const lines = stdoutBuffer.split('\n');
-      // Keep last incomplete line in buffer
-      stdoutBuffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (!line.trim()) continue;
-
-        if (tool === 'claude') {
-          try {
-            const event = JSON.parse(line);
-
-            // Init event — send session info
-            if (event.type === 'system' && event.subtype === 'init') {
-              // Extract context window from model name pattern (e.g. claude-opus-4-6[1m])
-              const modelMatch = (event.model || '').match(/\[(\d+)([km])\]/);
-              let contextWindow = 0;
-              if (modelMatch) {
-                contextWindow = parseInt(modelMatch[1]) * (modelMatch[2] === 'm' ? 1000000 : 1000);
-              }
-              reply.raw.write(`data: ${JSON.stringify({
-                session: {
-                  id: event.session_id,
-                  model: event.model,
-                  cwd: event.cwd,
-                  contextWindow,
-                },
-              })}\n\n`);
-              continue;
-            }
-
-            // Assistant message — stream text
-            if (event.type === 'assistant' && event.message?.content) {
-              for (const block of event.message.content) {
-                if (block.type === 'text') {
-                  reply.raw.write(`data: ${JSON.stringify({ text: block.text })}\n\n`);
-                }
-              }
-              continue;
-            }
-
-            // Result event — send cost/usage info
-            if (event.type === 'result') {
-              const usage = event.usage || {};
-              const contextUsed =
-                (usage.input_tokens || 0) +
-                (usage.output_tokens || 0) +
-                (usage.cache_read_input_tokens || 0) +
-                (usage.cache_creation_input_tokens || 0);
-
-              // Get contextWindow from modelUsage if available
-              let contextWindow = 0;
-              const modelUsage = event.modelUsage || {};
-              for (const v of Object.values(modelUsage) as any[]) {
-                if (v.contextWindow) {
-                  contextWindow = v.contextWindow;
-                  break;
-                }
-              }
-
-              reply.raw.write(`data: ${JSON.stringify({
-                result: {
-                  sessionId: event.session_id,
-                  cost: event.total_cost_usd,
-                  duration: event.duration_ms,
-                  turns: event.num_turns,
-                  contextUsed,
-                  contextWindow,
-                  inputTokens: usage.input_tokens || 0,
-                  outputTokens: usage.output_tokens || 0,
-                  cacheRead: usage.cache_read_input_tokens || 0,
-                  cacheCreation: usage.cache_creation_input_tokens || 0,
-                },
-              })}\n\n`);
-              continue;
-            }
-          } catch {
-            // Partial JSON — skip
-          }
-        } else {
-          // Gemini / Codex: send raw text
-          reply.raw.write(`data: ${JSON.stringify({ text: line })}\n\n`);
-        }
-      }
-    });
-
-    child.stderr!.on('data', (chunk: Buffer) => {
-      const text = chunk.toString().trim();
-      if (!text || text.startsWith('Reading additional input')) return;
-      reply.raw.write(`data: ${JSON.stringify({ error: text })}\n\n`);
-    });
-
-    child.on('close', (code: number | null) => {
-      reply.raw.write(`data: ${JSON.stringify({ done: true, exitCode: code })}\n\n`);
+      request.raw.on('close', () => {
+        child.kill('SIGTERM');
+      });
+    } catch (err: any) {
+      reply.raw.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
+      reply.raw.write(`data: ${JSON.stringify({ done: true, exitCode: 1 })}\n\n`);
       reply.raw.end();
-    });
-
-    request.raw.on('close', () => {
-      child.kill('SIGTERM');
-    });
+    }
   });
 }

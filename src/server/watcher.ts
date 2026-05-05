@@ -1,7 +1,7 @@
 import { watch } from 'chokidar';
 import { readFileSync, writeFileSync, appendFileSync, truncateSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { join, basename } from 'path';
-import { getRunner } from './runners/index.js';
+import { runPrompt } from './runners/execute.js';
 import { parseCommand, executeCommand, SessionData } from './commands.js';
 import { formatSessionLine } from '../shared/formatSession.js';
 
@@ -32,6 +32,97 @@ function loadSessions(promptDir: string): SessionMap {
 function saveSessions(promptDir: string, sessions: SessionMap) {
   const file = join(promptDir, SESSIONS_FILE);
   writeFileSync(file, JSON.stringify(sessions, null, 2));
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function repairSessions(promptDir: string) {
+  console.log('\n  [repair] Starting session repair...');
+
+  const sessionsFile = join(promptDir, SESSIONS_FILE);
+  const sessions = loadSessions(promptDir);
+
+  // 1. Backup
+  if (existsSync(sessionsFile)) {
+    const backupFile = sessionsFile + '.bak';
+    writeFileSync(backupFile, readFileSync(sessionsFile));
+    console.log('  [repair] Backed up .sessions.json -> .sessions.json.bak');
+  }
+
+  // 2. Scan existing .md files
+  const mdFiles = new Set(
+    readdirSync(promptDir).filter(f => f.endsWith('.md'))
+  );
+
+  const removed: string[] = [];
+  const deduplicated: string[] = [];
+  const invalidIds: string[] = [];
+  const emptyRemoved: string[] = [];
+
+  // 3. Remove entries whose .md file doesn't exist
+  for (const filename of Object.keys(sessions)) {
+    if (!mdFiles.has(filename)) {
+      removed.push(filename);
+      delete sessions[filename];
+    }
+  }
+
+  // 4. Deduplicate by sessionId
+  const seenIds = new Map<string, string>();
+  for (const [filename, data] of Object.entries(sessions)) {
+    if (data.sessionId) {
+      const existing = seenIds.get(data.sessionId);
+      if (existing) {
+        deduplicated.push(filename);
+        delete sessions[filename];
+      } else {
+        seenIds.set(data.sessionId, filename);
+      }
+    }
+  }
+
+  // 5. Validate sessionId format
+  for (const [filename, data] of Object.entries(sessions)) {
+    if (data.sessionId && !UUID_RE.test(data.sessionId)) {
+      invalidIds.push(`${filename} (${data.sessionId})`);
+      data.sessionId = undefined;
+    }
+  }
+
+  // 6. Remove empty/useless entries
+  for (const [filename, data] of Object.entries(sessions)) {
+    if (!data.sessionId && !data.totalCost && !data.totalTurns && !data.messages?.length) {
+      emptyRemoved.push(filename);
+      delete sessions[filename];
+    }
+  }
+
+  // 7. Save repaired sessions
+  saveSessions(promptDir, sessions);
+
+  // 8. Report
+  const total = removed.length + deduplicated.length + invalidIds.length + emptyRemoved.length;
+  if (total === 0) {
+    console.log('  [repair] No issues found.');
+  } else {
+    if (removed.length) {
+      console.log(`  [repair] Removed (missing .md): ${removed.length}`);
+      removed.forEach(f => console.log(`           - ${f}`));
+    }
+    if (deduplicated.length) {
+      console.log(`  [repair] Deduplicated: ${deduplicated.length}`);
+      deduplicated.forEach(f => console.log(`           - ${f}`));
+    }
+    if (invalidIds.length) {
+      console.log(`  [repair] Invalid sessionIds fixed: ${invalidIds.length}`);
+      invalidIds.forEach(f => console.log(`           - ${f}`));
+    }
+    if (emptyRemoved.length) {
+      console.log(`  [repair] Empty entries removed: ${emptyRemoved.length}`);
+      emptyRemoved.forEach(f => console.log(`           - ${f}`));
+    }
+  }
+  console.log('  [repair] Done.\n');
 }
 
 function formatTime(): string {
@@ -151,8 +242,8 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
   // Check for shared commands (/model, /help, /resume, etc.)
   const parsed = parseCommand(lastLine);
   if (parsed) {
-    // 有參數的 command 需要尾部換行確認（避免 auto-save 截斷參數）
-    if (parsed.args.length > 0 && !hasTrailingNewline) return;
+    // 所有 command 都需要尾部換行確認（與前端 /command\n 偵測一致）
+    if (!hasTrailingNewline) return;
     const sessions = loadSessions(promptDir);
     const sessionData = sessions[filename] || {};
     const result = await executeCommand(parsed.name, parsed.args, { cwd, filename, sessionData });
@@ -184,8 +275,9 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
     }
   }
 
-  // /plan 和 /run 是觸發器，無參數，不需要尾部換行
+  // /plan 和 /run 是觸發器，需要尾部換行確認（與前端一致）
   if (lastLine !== '/plan' && lastLine !== '/run') return;
+  if (!hasTrailingNewline) return;
 
   const mode = lastLine === '/plan' ? 'plan' : 'auto';
   const cmdLabel = mode === 'plan' ? '/plan' : '/run';
@@ -210,153 +302,81 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
 
   log(filename, '→', `${cmdLabel} ${prompt.slice(0, 60)}...`);
 
-  const runner = getRunner(selectedRunner);
-  if (!runner) {
-    appendToFile(filePath, `\n\n*Error: runner "${selectedRunner}" not found.*\n\n---\n`);
-    log(filename, '←', `error: runner "${selectedRunner}" not found`);
-    return;
-  }
-
-  const permissionMode = mode === 'plan' ? 'plan' : undefined;
-  const child = runner.run(prompt, cwd, {
-    sessionId,
-    permissionMode: permissionMode as 'plan' | undefined,
-    model: selectedModel || undefined,
-    addDirs: addDirs?.length ? addDirs : undefined,
-  });
-
-  return new Promise<void>((resolve) => {
-    let responseText = '';
-    let newSessionId = '';
-    let actualModel = '';
-    let stdoutBuffer = '';
-    let finished = false;
-    let resultCost = 0;
-    let resultInputTokens = 0;
-    let resultOutputTokens = 0;
-    let resultTurns = 0;
-    let resultCacheRead = 0;
-
-    const finish = (error?: string) => {
-      if (finished) return;
-      finished = true;
-      clearTimeout(timer);
-
-      if (error) {
-        // 合併到同一個 code block：移除 closing fence 再 append
-        const errTs = shortDateTime();
-        writingFiles.add(filePath);
-        const merged = removeClosingFence(filePath);
-        appendFileSync(filePath, merged
-          ? `${errTs} - error: ${error}\n\`\`\`\n\n---\n`
-          : `\n\n\`\`\`\n${errTs} - error: ${error}\n\`\`\`\n\n---\n`);
-        setTimeout(() => writingFiles.delete(filePath), 500);
-        log(filename, '←', `error: ${error}`);
-        resolve();
-        return;
-      }
-
-      // Save session mapping + cost
-      const prev = sessions[filename] || {};
-      const updated_session = {
-        ...prev,
-        ...(newSessionId ? { sessionId: newSessionId } : {}),
-        totalCost: (prev.totalCost || 0) + resultCost,
-        totalTurns: (prev.totalTurns || 0) + resultTurns,
-        totalInputTokens: (prev.totalInputTokens || 0) + resultInputTokens,
-        totalOutputTokens: (prev.totalOutputTokens || 0) + resultOutputTokens,
-      };
-      sessions[filename] = updated_session;
-      saveSessions(promptDir, sessions);
-
-      // Append-only：追加 result code block + AI 回應 + 分隔線
-      const endTime = formatTime();
-      const endTs = shortDateTime();
-      const finishInfo = formatSessionLine({
-        model: actualModel || modelDisplay,
-        session: newSessionId || sessionId,
-        turns: updated_session.totalTurns,
-        runCost: resultCost,
-        totalCost: updated_session.totalCost,
-        inputTokens: resultInputTokens,
-        outputTokens: resultOutputTokens,
-        cacheRead: resultCacheRead,
-        started: startTime,
-        completed: endTime,
-      });
-
-      // 合併到同一個 code block：移除 closing fence 再 append
-      const response = responseText.trim() || '*No response.*';
-      writingFiles.add(filePath);
-      const merged = removeClosingFence(filePath);
-      appendFileSync(filePath, merged
-        ? `${endTs} - ${finishInfo}\n\`\`\`\n\n${response}\n\n---\n`
-        : `\n\n\`\`\`\n${endTs} - ${finishInfo}\n\`\`\`\n\n${response}\n\n---\n`);
-      setTimeout(() => writingFiles.delete(filePath), 500);
-      const lines = response.split('\n').length;
-      log(filename, '←', `${lines} lines, ok`);
-      resolve();
-    };
+  try {
+    const { child, done } = runPrompt(selectedRunner, prompt, cwd, {
+      sessionId,
+      permissionMode: mode === 'plan' ? 'plan' : 'auto',
+      model: selectedModel || undefined,
+      addDirs: addDirs?.length ? addDirs : undefined,
+    });
 
     // Timeout
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
-      finish('timeout');
     }, TIMEOUT_MS);
 
-    child.stdout!.on('data', (chunk: Buffer) => {
-      stdoutBuffer += chunk.toString();
-      const jsonLines = stdoutBuffer.split('\n');
-      stdoutBuffer = jsonLines.pop() || '';
+    const runResult = await done;
+    clearTimeout(timer);
 
-      for (const line of jsonLines) {
-        if (!line.trim()) continue;
-        try {
-          const event = JSON.parse(line);
+    if (runResult.exitCode !== 0 && !runResult.text) {
+      // Error: append to code block
+      const errTs = shortDateTime();
+      writingFiles.add(filePath);
+      const merged = removeClosingFence(filePath);
+      appendFileSync(filePath, merged
+        ? `${errTs} - error: exit code ${runResult.exitCode}\n\`\`\`\n\n---\n`
+        : `\n\n\`\`\`\n${errTs} - error: exit code ${runResult.exitCode}\n\`\`\`\n\n---\n`);
+      setTimeout(() => writingFiles.delete(filePath), 500);
+      log(filename, '←', `error: exit code ${runResult.exitCode}`);
+      return;
+    }
 
-          if (event.type === 'system' && event.subtype === 'init') {
-            newSessionId = event.session_id || '';
-            if (event.model) actualModel = event.model;
-            continue;
-          }
+    // Save session mapping + cost
+    const prev = sessions[filename] || {};
+    const newSessionId = runResult.result?.sessionId || runResult.session?.id;
+    const resultCost = runResult.result?.cost || 0;
+    const resultTurns = runResult.result?.turns || 0;
+    const updated_session = {
+      ...prev,
+      ...(newSessionId ? { sessionId: newSessionId } : {}),
+      totalCost: (prev.totalCost || 0) + resultCost,
+      totalTurns: (prev.totalTurns || 0) + resultTurns,
+      totalInputTokens: (prev.totalInputTokens || 0) + (runResult.result?.inputTokens || 0),
+      totalOutputTokens: (prev.totalOutputTokens || 0) + (runResult.result?.outputTokens || 0),
+    };
+    sessions[filename] = updated_session;
+    saveSessions(promptDir, sessions);
 
-          if (event.type === 'assistant' && event.message?.content) {
-            for (const block of event.message.content) {
-              if (block.type === 'text') {
-                responseText += block.text;
-              }
-            }
-            continue;
-          }
-
-          if (event.type === 'result') {
-            if (event.session_id) newSessionId = event.session_id;
-            if (event.total_cost_usd) resultCost = event.total_cost_usd;
-            if (event.num_turns) resultTurns = event.num_turns;
-            if (event.usage) {
-              resultInputTokens = event.usage.input_tokens || 0;
-              resultOutputTokens = event.usage.output_tokens || 0;
-              resultCacheRead = event.usage.cache_read_input_tokens || 0;
-            }
-          }
-        } catch {
-          // Skip malformed JSON
-        }
-      }
+    // Append result code block + AI response + separator
+    const endTime = formatTime();
+    const endTs = shortDateTime();
+    const actualModel = runResult.session?.model || modelDisplay;
+    const finishInfo = formatSessionLine({
+      model: actualModel,
+      session: newSessionId || sessionId,
+      turns: updated_session.totalTurns,
+      runCost: resultCost,
+      totalCost: updated_session.totalCost,
+      inputTokens: runResult.result?.inputTokens,
+      outputTokens: runResult.result?.outputTokens,
+      cacheRead: runResult.result?.cacheRead,
+      started: startTime,
+      completed: endTime,
     });
 
-    child.on('close', (code) => {
-      if (code !== 0 && !responseText) {
-        finish(`exit code ${code}`);
-      } else {
-        finish();
-      }
-    });
-
-    child.on('error', (err) => {
-      finish(err.message);
-    });
-  });
+    const response = runResult.text.trim() || '*No response.*';
+    writingFiles.add(filePath);
+    const merged = removeClosingFence(filePath);
+    appendFileSync(filePath, merged
+      ? `${endTs} - ${finishInfo}\n\`\`\`\n\n${response}\n\n---\n`
+      : `\n\n\`\`\`\n${endTs} - ${finishInfo}\n\`\`\`\n\n${response}\n\n---\n`);
+    setTimeout(() => writingFiles.delete(filePath), 500);
+    const lines = response.split('\n').length;
+    log(filename, '←', `${lines} lines, ok`);
+  } catch (err: any) {
+    appendToFile(filePath, `\n\n*Error: ${err.message}*\n\n---\n`);
+    log(filename, '←', `error: ${err.message}`);
+  }
 }
 
 function scanPendingFiles(promptDir: string, cwd: string) {
@@ -370,8 +390,8 @@ function scanPendingFiles(promptDir: string, cwd: string) {
         if (!cmd) continue;
         const { lastLine, hasTrailingNewline } = cmd;
         const parsed = parseCommand(lastLine);
-        const canExecute = (parsed && (parsed.args.length === 0 || hasTrailingNewline))
-          || lastLine === '/plan' || lastLine === '/run';
+        const canExecute = hasTrailingNewline
+          && (parsed || lastLine === '/plan' || lastLine === '/run');
         if (canExecute) {
           log(file, '→', `pending: ${lastLine}`);
           enqueue(filePath, promptDir, cwd);
@@ -390,7 +410,7 @@ function cleanupStuckFiles(_promptDir: string) {
   // 舊的 /thinking... /running... 不再使用
 }
 
-export function startWatcher(cwd: string) {
+export function startWatcher(cwd: string, repair = false) {
   const promptDir = join(cwd, '.penpage');
 
   // Ensure directory exists
@@ -402,6 +422,11 @@ export function startWatcher(cwd: string) {
   const gitignorePath = join(promptDir, '.gitignore');
   if (!existsSync(gitignorePath)) {
     writeFileSync(gitignorePath, '*\n');
+  }
+
+  // Repair sessions if requested
+  if (repair) {
+    repairSessions(promptDir);
   }
 
   // Clean up any stuck files from previous runs

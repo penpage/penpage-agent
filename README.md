@@ -11,6 +11,8 @@ A local web UI that bridges your browser with AI coding CLIs. Run prompts agains
 - **Context tracking** — Live progress bar showing token usage and context window consumption
 - **Slash commands** — `/sessions`, `/resume`, `/cost`, `/model`, `/compact`, `/clear`, `/help`
 - **Single port** — Fastify API + Vite dev server on one port (default 3456)
+- **Telegram Bot** — Vibe-code from your phone via Telegram, even behind corporate proxies. Send prompts, receive real-time responses, and control AI tools on the go
+- **PenPage integration** — Full conversation history is saved as `.penpage/*.md` files, synced to [PenPage](https://penpage.com) for reading on any device
 
 ## Prerequisites
 
@@ -51,15 +53,81 @@ Open `http://localhost:3456` in your browser.
 
 ### Slash Commands
 
+All commands work in both the web UI and Telegram (defined once in `commands.ts`):
+
 | Command | Description |
 |---------|-------------|
-| `/sessions` | List recent Claude Code sessions for the current project |
-| `/resume [id]` | Resume a previous session (or pick from list) |
-| `/cost` | Show current session cost |
-| `/model [name]` | Set Claude model (e.g. `/model sonnet`) |
-| `/compact` | Send compact prompt to reduce context |
-| `/clear` | Clear chat display |
+| `/model [N\|name]` | Show or change model |
+| `/status` | Show Claude Code version, model, rate limits |
+| `/cost` | Show session cost and token usage |
+| `/resume [id\|N]` | List sessions or resume one |
+| `/new` | Start new session (keep model/dirs) |
+| `/clear` | Clear all session data |
+| `/history [N]` | Show conversation history |
+| `/add-dir <path>` | Add directory access |
+| `/dirs` | List project + added directories |
+| `/compact` | Compact Claude Code context (web UI only) |
 | `/help` | Show available commands |
+| `/ping` `/uptime` `/df` `/who` `/ip` `/mem` | System info |
+
+## Telegram Bot
+
+Send prompts and control AI tools from your phone via Telegram — even behind corporate HTTP proxies.
+
+### Setup
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) on Telegram
+2. Add the token to `.env` (copy from `.env.example`):
+   ```env
+   BOT_TOKEN=your_bot_token_here
+   ALLOWED_USER_ID=your_numeric_user_id
+   HTTPS_PROXY=http://proxy:port   # optional, for corporate firewalls
+   ```
+3. Run `npm run dev` — the bot starts automatically alongside the web UI
+4. Send `/help` to your bot to see your User ID and available commands
+
+No `BOT_TOKEN` = bot is silently skipped, web UI works as usual.
+
+### Telegram Commands
+
+| Command | Description |
+|---------|-------------|
+| `/plan <prompt>` | Run AI in plan mode (read-only, no file edits) |
+| `/run <prompt>` | Run AI in auto mode (can edit files) |
+| `/model [N\|name]` | Show or switch model |
+| `/cost` | Show session cost and token usage |
+| `/status` | Show Claude Code version and rate limits |
+| `/resume [id\|N]` | List or resume previous sessions |
+| `/new` | Start a new session (keep model/dirs settings) |
+| `/history [N]` | Show conversation history |
+| `/add-dir <path>` | Add directory access for AI |
+| `/dirs` | List project + added directories |
+| `/ping` `/uptime` `/df` `/who` `/ip` `/mem` | System info commands |
+
+Prompts can also end with `/plan` or `/run`:
+```
+Refactor UserService to async/await
+/plan
+```
+
+### How It Works
+
+```
+Phone (Telegram)              Mac (penpage-agent)
+─────────────────             ──────────────────
+Send /plan prompt  ──────→   Bot receives message
+                             Spawns claude -p (or gemini/codex)
+                             Streams AI response
+Get summary reply  ←──────   Sends last segment to Telegram
+View full history  ←──────   Writes full output to .penpage/*.md
+  on PenPage                   ↕ File Link sync to PenPage
+```
+
+- **Private chat** → saved to `.penpage/telegram.md`
+- **Group chat** → saved to `.penpage/tg-{group-name}.md`
+- Each chat maintains its own session (model, cost, history)
+- Sessions persist across restarts via `.penpage/telegram-sessions.json`
+- Concurrent protection: one AI prompt per chat at a time
 
 ## Architecture
 
@@ -68,12 +136,18 @@ src/
 ├── bin/cli.ts              # CLI entry point (--port, --cwd)
 ├── server/
 │   ├── index.ts            # Fastify + Vite unified server
+│   ├── commands.ts         # Unified slash commands (shared by all frontends)
 │   ├── routes/ai.ts        # API routes (tools, sessions, run)
 │   └── runners/            # AI CLI adapters
 │       ├── types.ts        # AIRunner interface
+│       ├── execute.ts      # Shared runPrompt() core
 │       ├── claude.ts       # Claude Code (stream-json)
 │       ├── gemini.ts       # Gemini CLI
 │       └── codex.ts        # Codex CLI
+├── telegram/
+│   └── bot.ts              # Telegram Bot (grammy)
+├── shared/
+│   └── formatSession.ts    # Session info formatting
 └── client/
     ├── index.html          # Single page
     ├── app.ts              # Chat UI + session management

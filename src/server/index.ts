@@ -10,7 +10,7 @@ import { startWatcher } from './watcher.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-export async function createServer(port: number, projectCwd: string, dev = false) {
+export async function createServer(port: number, projectCwd: string, dev = false, repair = false) {
   const app = Fastify({ logger: false });
 
   await app.register(fastifyCors, { origin: true });
@@ -52,7 +52,7 @@ export async function createServer(port: number, projectCwd: string, dev = false
   await app.listen({ port, host: '127.0.0.1' });
 
   // Start file watcher for .penpage/*.md
-  startWatcher(projectCwd);
+  startWatcher(projectCwd, repair);
 
   return app;
 }
