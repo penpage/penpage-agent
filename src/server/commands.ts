@@ -606,20 +606,27 @@ function listPageSessions(cwd: string): SessionEntry[] {
   } catch { return []; }
 }
 
+/** CLI session 回傳型別（帶檔案路徑） */
+interface CliSessionEntry extends SessionEntry {
+  _cliJsonPath?: string;
+}
+
 /** 讀取 ~/.claude/sessions/*.json 中的 CLI sessions */
-function listCliSessions(cwd: string): SessionEntry[] {
+function listCliSessions(cwd: string): CliSessionEntry[] {
   const sessionsDir = join(homedir(), '.claude', 'sessions');
   try {
     return readdirSync(sessionsDir)
       .filter(f => f.endsWith('.json'))
       .map(f => {
         try {
-          const data = JSON.parse(readFileSync(join(sessionsDir, f), 'utf-8'));
+          const filePath = join(sessionsDir, f);
+          const data = JSON.parse(readFileSync(filePath, 'utf-8'));
           return {
             sessionId: data.sessionId as string,
             name: (data.name || 'unnamed') as string,
             startedAt: data.startedAt as number,
             cwd: data.cwd as string,
+            _cliJsonPath: filePath,
           };
         } catch { return null; }
       })
@@ -699,6 +706,7 @@ function extractMetaFromJsonl(fullPath: string): { name: string; entrypoint: str
   try {
     const chunk = readFileSync(fullPath, { encoding: 'utf-8', flag: 'r' }).slice(0, 8192);
     let entrypoint = '';
+    let firstCommand = '';
     for (const line of chunk.split('\n')) {
       if (!line.trim()) continue;
       try {
@@ -710,14 +718,18 @@ function extractMetaFromJsonl(fullPath: string): { name: string; entrypoint: str
         // 跳過 tool_result（content 是 array）
         if (typeof msg?.content !== 'string') continue;
         let text = msg.content;
-        // 跳過指令訊息
-        if (text.includes('<command-name>')) continue;
+        // 記住第一個指令名稱作為 fallback
+        if (!firstCommand && text.includes('<command-name>')) {
+          const m = text.match(/<command-name>\/?([^<]+)<\/command-name>/);
+          if (m) firstCommand = m[1].trim();
+          continue;
+        }
         // 移除 XML tags，正規化空白
         text = text.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
         if (text) return { name: text.slice(0, 40), entrypoint };
       } catch {}
     }
-    return { name: '', entrypoint };
+    return { name: firstCommand ? `/${firstCommand}` : '', entrypoint };
   } catch {}
   return { name: '', entrypoint: '' };
 }
@@ -732,17 +744,36 @@ function getMergedSessions(cwd: string, addDirs?: string[]): SessionEntry[] {
     for (const s of listProjectSessions(dir)) {
       if (!map.has(s.sessionId)) map.set(s.sessionId, { ...s });
     }
-    // CLI sessions 覆蓋基本欄位但保留 project 的補充資訊
+    // CLI sessions 補充 startedAt，但不用 'unnamed' 覆蓋已有名稱
     for (const s of listCliSessions(dir)) {
       const existing = map.get(s.sessionId);
-      map.set(s.sessionId, existing ? { ...existing, ...s, messageCount: existing.messageCount, projectName: existing.projectName, entrypoint: existing.entrypoint } : { ...s });
+      if (existing) {
+        if (s.startedAt) existing.startedAt = s.startedAt;
+        if (s.name && s.name !== 'unnamed') {
+          existing.name = s.name;
+        } else if (existing.name && existing.name !== 'unnamed' && s._cliJsonPath) {
+          // CLI name 是 unnamed 但 project 有好名稱 → 寫回 CLI JSON
+          try {
+            const data = JSON.parse(readFileSync(s._cliJsonPath, 'utf-8'));
+            data.name = existing.name;
+            writeFileSync(s._cliJsonPath, JSON.stringify(data));
+          } catch {}
+        }
+      } else {
+        map.set(s.sessionId, { ...s });
+      }
     }
-    // page sessions 優先（有 cost/turns/pageFile），但保留 messageCount、projectName、entrypoint
+    // page sessions 補充 pageFile/cost/turns，保留已有的 name、projectName、entrypoint
     for (const s of listPageSessions(dir)) {
       const existing = map.get(s.sessionId);
-      map.set(s.sessionId, existing
-        ? { ...existing, ...s, messageCount: existing.messageCount ?? s.messageCount, projectName: existing.projectName ?? s.projectName, entrypoint: existing.entrypoint ?? s.entrypoint }
-        : { ...s });
+      if (existing) {
+        existing.pageFile = s.pageFile;
+        existing.totalCost = s.totalCost ?? existing.totalCost;
+        existing.totalTurns = s.totalTurns ?? existing.totalTurns;
+        existing.messageCount = existing.messageCount ?? s.messageCount;
+      } else {
+        map.set(s.sessionId, { ...s });
+      }
     }
   }
 
