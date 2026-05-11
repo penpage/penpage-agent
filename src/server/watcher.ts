@@ -1,9 +1,9 @@
 import { watch } from 'chokidar';
 import { readFileSync, writeFileSync, appendFileSync, truncateSync, existsSync, mkdirSync, readdirSync } from 'fs';
 import { join, basename } from 'path';
-import { runPrompt } from './runners/execute.js';
+import { runPrompt, compactSession } from './runners/execute.js';
 import { parseCommand, executeCommand, SessionData } from './commands.js';
-import { formatSessionLine } from '../shared/formatSession.js';
+import { formatSessionLine, formatLogLine, formatCompactInfo } from '../shared/formatSession.js';
 
 interface SessionMap {
   [filename: string]: SessionData;
@@ -144,8 +144,7 @@ function shortDateTime(): string {
 
 const LOG_FILE = '/tmp/penpage-agent.log';
 
-function log(file: string, arrow: string, msg: string) {
-  const line = `  ${shortTime()}  ${file} ${arrow} ${msg}`;
+function logRaw(line: string) {
   console.log(line);
   try { appendFileSync(LOG_FILE, line + '\n'); } catch { /* ignore */ }
 }
@@ -239,7 +238,7 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
 
   const { lastLine, hasTrailingNewline } = cmd;
 
-  // Check for shared commands (/model, /help, /resume, etc.)
+  // Check for shared commands (/model, /help, /session, etc.)
   const parsed = parseCommand(lastLine);
   if (parsed) {
     // 所有 command 都需要尾部換行確認（與前端 /command\n 偵測一致）
@@ -258,6 +257,30 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
       const mergedModelDisplay = merged.model ? `${mergedRunner} - ${merged.model}` : mergedRunner;
       const cmdLine = `/${parsed.name}${parsed.args.length ? ' ' + parsed.args.join(' ') : ''}`;
       const ts = shortDateTime();
+
+      // /compact → 送 '/compact' 給 CLI
+      if (result.action === 'compact' && merged.sessionId) {
+        logRaw(formatLogLine({ source: 'agent', filename, model: mergedModelDisplay, sessionId: merged.sessionId, command: '/compact' }));
+        appendToFile(filePath, `\n\n\`\`\`\n${ts} ⏳compact...\n\`\`\`\n`);
+        try {
+          const compactResult = await compactSession(merged.sessionId, cwd);
+          const endTs = shortDateTime();
+          const cr = compactResult.result;
+          const compactInfo = cr ? ` ${formatCompactInfo({
+            afterCtxUsed: cr.contextUsed, afterCtxWindow: cr.contextWindow,
+            afterCacheRead: cr.cacheRead, afterInputTokens: cr.inputTokens, afterOutputTokens: cr.outputTokens,
+          })}` : '';
+          writingFiles.add(filePath);
+          appendFileSync(filePath, `\n\`\`\`\n${endTs} ✅compact${compactInfo}\n\`\`\`\n\n---\n`);
+          setTimeout(() => writingFiles.delete(filePath), 500);
+          logRaw(formatLogLine({ source: 'agent', filename, model: mergedModelDisplay, sessionId: merged.sessionId, status: `compacted${compactInfo}` }));
+        } catch {
+          appendToFile(filePath, `\n\`\`\`\n❌compact failed\n\`\`\`\n\n---\n`);
+          logRaw(formatLogLine({ source: 'agent', filename, model: mergedModelDisplay, sessionId: merged.sessionId, status: 'compact-err' }));
+        }
+        return;
+      }
+
       const info = formatSessionLine({
         model: mergedModelDisplay,
         session: merged.sessionId,
@@ -266,11 +289,11 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
         completed: formatTime(),
       });
       // Append-only：只追加，不修改既有內容
-      const cmdSid = merged.sessionId ? `${merged.sessionId.slice(0, 7)} ` : '';
-      const appendContent = `\n\n\`\`\`\n${ts} - ${cmdSid}Command: ${cmdLine}\n${ts} - ${info}\n\`\`\`\n\n${result.markdown}\n\n---\n`;
-      log(filename, '→', cmdLine);
+      const cmdSid = merged.sessionId ? merged.sessionId.slice(0, 7) : '';
+      const appendContent = `\n\n\`\`\`\n${ts} ✳️${cmdSid} ${cmdLine}\n\`\`\`\n\n${result.markdown}\n\n\`\`\`\n${ts} ✅${info}\n\`\`\`\n\n---\n`;
+      logRaw(formatLogLine({ source: 'agent', filename, model: mergedModelDisplay, sessionId: merged.sessionId, command: cmdLine }));
       appendToFile(filePath, appendContent);
-      log(filename, '←', 'ok');
+      logRaw(formatLogLine({ source: 'agent', filename, model: mergedModelDisplay, sessionId: merged.sessionId, status: 'ok', totalCost: merged.totalCost, turns: merged.totalTurns }));
       return;
     }
   }
@@ -298,9 +321,9 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
   const startTs = shortDateTime();
   const modelDisplay = selectedModel ? `${selectedRunner} - ${selectedModel}` : selectedRunner;
   const sidTag = sessionId ? `${sessionId.slice(0, 7)} ` : '';
-  appendToFile(filePath, `\n\n\`\`\`\n${startTs} - ${sidTag}Command: ${cmdLabel}\n\`\`\`\n`);
+  appendToFile(filePath, `\n\n\`\`\`\n${startTs} ✳️${sidTag}${cmdLabel}\n\`\`\`\n`);
 
-  log(filename, '→', `${cmdLabel} ${prompt.slice(0, 60)}...`);
+  logRaw(formatLogLine({ source: 'agent', filename, model: modelDisplay, sessionId, command: cmdLabel, promptPreview: prompt }));
 
   try {
     const { child, done } = runPrompt(selectedRunner, prompt, cwd, {
@@ -319,15 +342,12 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
     clearTimeout(timer);
 
     if (runResult.exitCode !== 0 && !runResult.text) {
-      // Error: append to code block
+      // Error: 獨立 code block
       const errTs = shortDateTime();
       writingFiles.add(filePath);
-      const merged = removeClosingFence(filePath);
-      appendFileSync(filePath, merged
-        ? `${errTs} - error: exit code ${runResult.exitCode}\n\`\`\`\n\n---\n`
-        : `\n\n\`\`\`\n${errTs} - error: exit code ${runResult.exitCode}\n\`\`\`\n\n---\n`);
+      appendFileSync(filePath, `\n\n\`\`\`\n${errTs} ❌error: exit code ${runResult.exitCode}\n\`\`\`\n\n---\n`);
       setTimeout(() => writingFiles.delete(filePath), 500);
-      log(filename, '←', `error: exit code ${runResult.exitCode}`);
+      logRaw(formatLogLine({ source: 'agent', filename, model: modelDisplay, sessionId, status: `err:${runResult.exitCode}` }));
       return;
     }
 
@@ -360,22 +380,57 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
       inputTokens: runResult.result?.inputTokens,
       outputTokens: runResult.result?.outputTokens,
       cacheRead: runResult.result?.cacheRead,
+      cacheCreation: runResult.result?.cacheCreation,
+      contextUsed: runResult.result?.contextUsed,
+      contextWindow: runResult.result?.contextWindow,
       started: startTime,
       completed: endTime,
     });
 
     const response = runResult.text.trim() || '*No response.*';
     writingFiles.add(filePath);
-    const merged = removeClosingFence(filePath);
-    appendFileSync(filePath, merged
-      ? `${endTs} - ${finishInfo}\n\`\`\`\n\n${response}\n\n---\n`
-      : `\n\n\`\`\`\n${endTs} - ${finishInfo}\n\`\`\`\n\n${response}\n\n---\n`);
+    appendFileSync(filePath, `\n${response}\n\n\`\`\`\n${endTs} ✅${finishInfo}\n\`\`\`\n\n---\n`);
     setTimeout(() => writingFiles.delete(filePath), 500);
-    const lines = response.split('\n').length;
-    log(filename, '←', `${lines} lines, ok`);
+    const respLines = response.split('\n').length;
+    const durationSec = Math.round((new Date(endTime.replace(' ', 'T')).getTime() - new Date(startTime.replace(' ', 'T')).getTime()) / 1000);
+    logRaw(formatLogLine({
+      source: 'agent', filename, model: actualModel, sessionId: newSessionId || sessionId,
+      status: 'ok', lines: respLines, runCost: resultCost, totalCost: updated_session.totalCost,
+      turns: updated_session.totalTurns, inputTokens: runResult.result?.inputTokens,
+      outputTokens: runResult.result?.outputTokens,
+      contextUsed: runResult.result?.contextUsed, contextWindow: runResult.result?.contextWindow,
+      durationSec,
+    }));
+
+    // Auto compact：context > 70% 時自動壓縮
+    const finalSid = newSessionId || sessionId;
+    const rr = runResult.result;
+    if (finalSid && rr?.contextUsed && rr?.contextWindow) {
+      const pct = (rr.contextUsed / rr.contextWindow) * 100;
+      if (pct > 70) {
+        logRaw(formatLogLine({ source: 'agent', filename, model: actualModel, sessionId: finalSid, command: `auto-compact (ctx ${pct.toFixed(0)}%)` }));
+        try {
+          const compactResult = await compactSession(finalSid, cwd);
+          const cr = compactResult.result;
+          const compactInfo = formatCompactInfo({
+            beforeCtxUsed: rr.contextUsed, beforeCtxWindow: rr.contextWindow,
+            beforeCacheRead: rr.cacheRead, beforeInputTokens: rr.inputTokens, beforeOutputTokens: rr.outputTokens,
+            afterCtxUsed: cr?.contextUsed, afterCtxWindow: cr?.contextWindow,
+            afterCacheRead: cr?.cacheRead, afterInputTokens: cr?.inputTokens, afterOutputTokens: cr?.outputTokens,
+          });
+          const acTs = shortDateTime();
+          writingFiles.add(filePath);
+          appendFileSync(filePath, `\n\`\`\`\n${acTs} ✅auto-compact ${compactInfo}\n\`\`\`\n`);
+          setTimeout(() => writingFiles.delete(filePath), 500);
+          logRaw(formatLogLine({ source: 'agent', filename, model: actualModel, sessionId: finalSid, status: `auto-compacted ${compactInfo}` }));
+        } catch {
+          logRaw(formatLogLine({ source: 'agent', filename, model: actualModel, sessionId: finalSid, status: 'auto-compact-err' }));
+        }
+      }
+    }
   } catch (err: any) {
     appendToFile(filePath, `\n\n*Error: ${err.message}*\n\n---\n`);
-    log(filename, '←', `error: ${err.message}`);
+    logRaw(formatLogLine({ source: 'agent', filename, model: modelDisplay, sessionId, status: `err:${err.message}` }));
   }
 }
 
@@ -393,7 +448,7 @@ function scanPendingFiles(promptDir: string, cwd: string) {
         const canExecute = hasTrailingNewline
           && (parsed || lastLine === '/plan' || lastLine === '/run');
         if (canExecute) {
-          log(file, '→', `pending: ${lastLine}`);
+          logRaw(formatLogLine({ source: 'agent', filename: file, command: `pending: ${lastLine}` }));
           enqueue(filePath, promptDir, cwd);
         }
       } catch {

@@ -647,6 +647,38 @@ async function runPrompt() {
     sendBtn.disabled = false;
     updateRunButton();
   }
+
+  // Auto compact：context > 70% 時自動壓縮
+  const session = sessions[selectedTool];
+  if (selectedTool === 'claude' && session?.id && session.contextUsed && session.contextWindow) {
+    const pct = (session.contextUsed / session.contextWindow) * 100;
+    if (pct > 70) {
+      addSystemMessage(`⚡ Context ${pct.toFixed(0)}% > 70%, auto compacting...`);
+      try {
+        const res = await fetch('/api/ai/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt: '/compact',
+            tool: selectedTool,
+            cwd: config.cwd,
+            sessionId: session.id,
+          }),
+        });
+        if (res.ok) {
+          const reader = res.body!.getReader();
+          while (true) {
+            const { done } = await reader.read();
+            if (done) break;
+          }
+          addSystemMessage('✅ Auto compact done.');
+        }
+      } catch {
+        addSystemMessage('❌ Auto compact failed.');
+      }
+      updateSessionBar();
+    }
+  }
 }
 
 // Event listeners

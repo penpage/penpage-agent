@@ -40,6 +40,15 @@ export interface RunResult {
 
 // --- Core execution ---
 
+/** 送 /compact 給 Claude Code CLI，壓縮 context window */
+export function compactSession(
+  sessionId: string,
+  cwd: string,
+): Promise<RunResult> {
+  const { done } = runPrompt('claude', '/compact', cwd, { sessionId });
+  return done;
+}
+
 export function runPrompt(
   tool: string,
   prompt: string,

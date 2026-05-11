@@ -3,8 +3,8 @@ import { HttpsProxyAgent } from 'https-proxy-agent';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { parseCommand, executeCommand, SessionData, ChatMessage } from '../server/commands.js';
-import { runPrompt, RunResult } from '../server/runners/execute.js';
-import { formatSessionLine } from '../shared/formatSession.js';
+import { runPrompt, RunResult, compactSession } from '../server/runners/execute.js';
+import { formatSessionLine, formatLogLine, formatCompactInfo } from '../shared/formatSession.js';
 
 /** 解析 AI prompt mode（/plan 或 /run 在開頭或結尾） */
 function parseMode(text: string): { mode: 'plan' | 'run'; prompt: string } {
@@ -50,8 +50,8 @@ function splitMessage(text: string): string[] {
   return chunks;
 }
 
-/** 對話紀錄上限（user+assistant 各算一筆） */
-const MAX_HISTORY_MESSAGES = 40;
+/** 對話紀錄上限（user+assistant 各算一筆，過大會灌爆 context window） */
+const MAX_HISTORY_MESSAGES = 15;
 
 /** 將對話紀錄組成 context 前綴，讓 Claude 理解先前對話 */
 function buildHistoryContext(messages: ChatMessage[]): string {
@@ -59,7 +59,7 @@ function buildHistoryContext(messages: ChatMessage[]): string {
   const lines = messages.map((m) => {
     const label = m.role === 'user' ? 'User' : 'Assistant';
     // 截斷過長的單則訊息，避免超出 context window
-    const content = m.content.length > 3000 ? m.content.slice(0, 3000) + '\n...(truncated)' : m.content;
+    const content = m.content.length > 1500 ? m.content.slice(0, 1500) + '\n...(truncated)' : m.content;
     return `${label}:\n${content}`;
   });
   return `Here is our previous conversation for context:\n\n${lines.join('\n\n---\n\n')}\n\n---\n\nNow respond to the following:\n\n`;
@@ -237,8 +237,8 @@ export function startTelegramBot(cwd: string) {
       },
     });
 
-    // 5 分鐘 timeout，避免 Claude Code 卡住導致 chat 永久鎖定
-    const TIMEOUT_MS = 5 * 60 * 1000;
+    // 10 分鐘 timeout，避免 Claude Code 卡住導致 chat 永久鎖定
+    const TIMEOUT_MS = 10 * 60 * 1000;
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -272,6 +272,7 @@ export function startTelegramBot(cwd: string) {
     busyChats.add(chatId);
 
     const startTime = shortDateTime();
+    const startMs = Date.now();
 
     // 送出「思考中」訊息，後續用 editMessageText 更新進度
     const mdFile = getMdFilename(ctx.chat!, sessionData);
@@ -288,6 +289,14 @@ export function startTelegramBot(cwd: string) {
 
     // 初始化對話紀錄
     if (!sessionData.messages) sessionData.messages = [];
+
+    const cmdLabel = mode === 'plan' ? '/plan' : '/run';
+    const botRunner = sessionData.runner || 'claude';
+    const botModel = sessionData.model ? `${botRunner} - ${sessionData.model}` : botRunner;
+    console.log(formatLogLine({
+      source: 'bot', filename: mdFile, model: botModel, sessionId: sessionData.sessionId,
+      chat: ctx.chat!, command: cmdLabel, promptPreview: prompt,
+    }));
 
     let result: RunResult;
     let actualPrompt = prompt;
@@ -320,7 +329,10 @@ export function startTelegramBot(cwd: string) {
         );
       }
     } catch (err: any) {
-      console.error('  ❌ AI prompt error:', err);
+      console.log(formatLogLine({
+        source: 'bot', filename: mdFile, model: botModel, sessionId: sessionData.sessionId,
+        chat: ctx.chat!, status: `err:${err.message}`,
+      }));
       await ctx.api.editMessageText(
         statusMsg.chat.id,
         statusMsg.message_id,
@@ -372,36 +384,10 @@ export function startTelegramBot(cwd: string) {
       }
     }
 
-    // 發送 cost summary（含 session ID + context 使用量 + 高使用警告）
-    if (result.result) {
-      const r = result.result;
-      const sid = sessionData.sessionId ? sessionData.sessionId.slice(0, 7) : '?';
-      const turnLabel = `turn ${sessionData.totalTurns || 0}`;
-      let contextInfo = '';
-      let contextWarning = '';
-      if (r.contextUsed && r.contextWindow) {
-        const pct = (r.contextUsed / r.contextWindow) * 100;
-        contextInfo = ` | ctx ${pct.toFixed(0)}%`;
-        if (pct > 85) {
-          contextWarning = '\n⚠️ Context window 即將滿載，建議用 /new 開新 session';
-        } else if (pct > 70) {
-          contextWarning = '\n⚡ Context 使用量超過 70%';
-        }
-      }
-      await ctx.reply(
-        `💰 $${r.cost?.toFixed(4) || '0'} | ${turnLabel} | total: $${(sessionData.totalCost || 0).toFixed(4)} | session: ${sid}${contextInfo}${contextWarning}`,
-      );
-    }
-
-    // 寫入 .penpage/*.md 完整對話紀錄
-    const mdPath = join(promptDir, mdFile);
-    const endTime = shortDateTime();
-    const sid = sessionData.sessionId ? sessionData.sessionId.slice(0, 7) + ' ' : '';
-    const cmdLabel = mode === 'plan' ? '/plan' : '/run';
-    const runner = sessionData.runner || 'claude';
-    const modelLabel = sessionData.model ? `${runner} - ${sessionData.model}` : runner;
-    const actualModel = result.session?.model || modelLabel;
-    const info = formatSessionLine({
+    // 共用 session data
+    const actualModel = result.session?.model || botModel;
+    const botDurSec = Math.round((Date.now() - startMs) / 1000);
+    const sessionLineData = {
       model: actualModel,
       session: sessionData.sessionId,
       turns: sessionData.totalTurns,
@@ -410,19 +396,80 @@ export function startTelegramBot(cwd: string) {
       inputTokens: result.result?.inputTokens,
       outputTokens: result.result?.outputTokens,
       cacheRead: result.result?.cacheRead,
-    });
+      cacheCreation: result.result?.cacheCreation,
+      contextUsed: result.result?.contextUsed,
+      contextWindow: result.result?.contextWindow,
+      durationSec: botDurSec,
+    };
+    const info = formatSessionLine(sessionLineData);
+
+    // 發送 cost summary（與 md 格式一致，只差沒日期時間）
+    if (result.result) {
+      let contextWarning = '';
+      const r = result.result;
+      if (r.contextUsed && r.contextWindow) {
+        const pct = Math.round((r.contextUsed / r.contextWindow) * 100);
+        if (pct > 85) {
+          contextWarning = '\n⚠️ Context 即將滿載，自動壓縮中...';
+        } else if (pct > 70) {
+          contextWarning = '\n⚡ Context > 70%，自動壓縮中...';
+        }
+      }
+      await ctx.reply(`✅${info}${contextWarning}`);
+    }
+
+    // 寫入 .penpage/*.md 完整對話紀錄（開始/結束分開 code block）
+    const mdPath = join(promptDir, mdFile);
+    const endTime = shortDateTime();
+    const sid = sessionData.sessionId ? sessionData.sessionId.slice(0, 7) : '';
     const response = output || '*No response.*';
-    const block = `\n${prompt}\n\n\`\`\`\n${startTime} - ${sid}Command: ${cmdLabel}\n${endTime} - ${info}\n\`\`\`\n\n${response}\n\n---\n`;
+    const block = `\n${prompt}\n\n\`\`\`\n${startTime} ✳️${sid} ${cmdLabel}\n\`\`\`\n\n${response}\n\n\`\`\`\n${endTime} ✅${info}\n\`\`\`\n\n---\n`;
     try {
       appendFileSync(mdPath, block);
-      console.log(`  📝 Written to ${mdFile} (${block.length} chars)`);
     } catch (writeErr: any) {
       console.error(`  ❌ Failed to write ${mdPath}: ${writeErr.message}`);
     }
 
-    // 如果目標是特定 page，同步更新 .sessions.json（讓 file watcher / PenPage 看到）
-    if (sessionData.targetPage) {
-      updateFileSession(promptDir, sessionData.targetPage, {
+    // ← log（統一格式）
+    const finalModel = result.session?.model || botModel;
+    const finalSid = sessionData.sessionId;
+    console.log(formatLogLine({
+      source: 'bot', filename: mdFile, model: finalModel, sessionId: finalSid,
+      chat: ctx.chat!, status: 'ok',
+      runCost: result.result?.cost, totalCost: sessionData.totalCost,
+      turns: sessionData.totalTurns,
+      inputTokens: result.result?.inputTokens, outputTokens: result.result?.outputTokens,
+      contextUsed: result.result?.contextUsed, contextWindow: result.result?.contextWindow,
+      durationSec: botDurSec,
+    }));
+
+    // Auto compact：context > 70% 時自動壓縮
+    if (result.result && sessionData.sessionId) {
+      const r = result.result;
+      if (r.contextUsed && r.contextWindow) {
+        const pct = (r.contextUsed / r.contextWindow) * 100;
+        if (pct > 70) {
+          console.log(`  🔄 Auto compact: ctx ${pct.toFixed(0)}% > 70%`);
+          try {
+            const compactResult = await compactSession(sessionData.sessionId, cwd);
+            const cr = compactResult.result;
+            const compactInfo = formatCompactInfo({
+              beforeCtxUsed: r.contextUsed, beforeCtxWindow: r.contextWindow,
+              beforeCacheRead: r.cacheRead, beforeInputTokens: r.inputTokens, beforeOutputTokens: r.outputTokens,
+              afterCtxUsed: cr?.contextUsed, afterCtxWindow: cr?.contextWindow,
+              afterCacheRead: cr?.cacheRead, afterInputTokens: cr?.inputTokens, afterOutputTokens: cr?.outputTokens,
+            });
+            await ctx.reply(`✅auto-compact ${compactInfo}`);
+          } catch {
+            console.log('  ⚠️ Auto compact failed');
+          }
+        }
+      }
+    }
+
+    // 同步更新 .sessions.json（讓 file watcher / PenPage 看到）
+    {
+      updateFileSession(promptDir, mdFile, {
         sessionId: sessionData.sessionId,
         runner: sessionData.runner,
         model: sessionData.model,
@@ -435,18 +482,18 @@ export function startTelegramBot(cwd: string) {
     }
   }
 
-  // Log middleware
+  // Log middleware — 用統一格式記錄收到的訊息
   bot.use(async (ctx, next) => {
-    const chat = ctx.chat;
-    const from = ctx.from;
-    if (chat && from) {
-      const time = new Date().toLocaleTimeString();
+    if (ctx.chat && ctx.from) {
       const text = ctx.message?.text || ctx.callbackQuery?.data || '';
-      console.log(`--- [${time}] 收到訊息 ---`);
-      console.log(`  Chat:`, JSON.stringify(chat, null, 4));
-      console.log(`  From:`, JSON.stringify(from, null, 4));
-      console.log(`  Text: ${text}`);
-      console.log(`---`);
+      const mdFile = getMdFilename(ctx.chat as any, getSession(ctx.chat.id));
+      const sd = chatSessions.get(ctx.chat.id);
+      const runner = sd?.runner || 'claude';
+      const model = sd?.model ? `${runner} - ${sd.model}` : runner;
+      console.log(formatLogLine({
+        source: 'bot', filename: mdFile, model, sessionId: sd?.sessionId,
+        chat: ctx.chat as any, command: text.slice(0, 60),
+      }));
     }
     await next();
   });
@@ -481,7 +528,7 @@ export function startTelegramBot(cwd: string) {
       return;
     }
 
-    // 1. 嘗試 slash command（/model, /status, /cost, /resume, /clear 等）
+    // 1. 嘗試 slash command（/model, /diag, /cost, /session, /clear 等）
     const parsed = parseCommand(text);
     if (parsed) {
       const result = await executeCommand(parsed.name, parsed.args, {
@@ -490,6 +537,17 @@ export function startTelegramBot(cwd: string) {
         sessionData,
       });
       if (result) {
+        // /compact → 送 '/compact' 給 CLI
+        if (result.action === 'compact' && sessionData.sessionId) {
+          await ctx.reply(result.markdown);
+          try {
+            await compactSession(sessionData.sessionId, cwd);
+            await ctx.reply('✅ Context compacted.');
+          } catch {
+            await ctx.reply('❌ Compact failed.');
+          }
+          return;
+        }
         await ctx.reply(result.markdown);
         if (result.sessionUpdate) {
           Object.assign(sessionData, result.sessionUpdate);
