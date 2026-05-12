@@ -588,6 +588,7 @@ interface SessionEntry {
   entrypoint?: string;
   gitBranch?: string;
   fileSize?: number;
+  customTitle?: string;
 }
 
 /** 讀取 .penpage/.sessions.json 中的 page sessions */
@@ -738,22 +739,22 @@ function listProjectSessions(cwd: string): SessionEntry[] {
       const mtime = statSync(fullPath).mtimeMs;
       const idx = indexLookup.get(sessionId);
 
-      // 讀 JSONL 取名稱和 entrypoint
+      // 讀 JSONL 取名稱、entrypoint、prompt 數
       const meta = extractMetaFromJsonl(fullPath);
-      // 名稱優先用 index（有 customTitle/agentName），否則用 JSONL
-      let name = idx?.customTitle || idx?.agentName || meta.name;
-      if (!name) name = 'unnamed';
+      // name 只存 first prompt（customTitle 由 getSessionTailInfo 在 display 層處理）
+      let name = meta.name || idx?.agentName || 'unnamed';
 
       results.push({
         sessionId,
         name,
         startedAt: idx ? new Date(idx.created).getTime() : mtime,
         modifiedAt: mtime, // JSONL mtime = 最後使用時間（最可靠）
-        messageCount: idx?.messageCount,
+        messageCount: meta.promptCount,
         projectName,
         entrypoint: meta.entrypoint,
         gitBranch: idx?.gitBranch || meta.gitBranch,
         fileSize: statSync(fullPath).size,
+        customTitle: idx?.customTitle,
       });
     }
   } catch {}
@@ -761,39 +762,50 @@ function listProjectSessions(cwd: string): SessionEntry[] {
   return results;
 }
 
-/** 從 JSONL 前 8KB 提取第一條 user message 的名稱、entrypoint、gitBranch */
-function extractMetaFromJsonl(fullPath: string): { name: string; entrypoint: string; gitBranch: string } {
+/** 從 JSONL 提取 meta：前 8KB 取 name/entrypoint/gitBranch，全檔計算 promptCount */
+function extractMetaFromJsonl(fullPath: string): { name: string; entrypoint: string; gitBranch: string; promptCount: number } {
   try {
-    const chunk = readFileSync(fullPath, { encoding: 'utf-8', flag: 'r' }).slice(0, 8192);
+    const content = readFileSync(fullPath, 'utf-8');
+    const chunk = content.slice(0, 8192);
     let entrypoint = '';
     let gitBranch = '';
     let firstCommand = '';
+    let name = '';
     for (const line of chunk.split('\n')) {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
         if (obj.type !== 'user' || obj.isMeta) continue;
-        // 取第一個 user message 的 entrypoint 和 gitBranch
         if (!entrypoint) entrypoint = obj.entrypoint || '';
         if (!gitBranch) gitBranch = obj.gitBranch || '';
+        if (name) continue; // name 已找到，繼續找 entrypoint/gitBranch
         const msg = obj.message;
-        // 跳過 tool_result（content 是 array）
         if (typeof msg?.content !== 'string') continue;
         let text = msg.content;
-        // 記住第一個指令名稱作為 fallback
         if (!firstCommand && text.includes('<command-name>')) {
           const m = text.match(/<command-name>\/?([^<]+)<\/command-name>/);
           if (m) firstCommand = m[1].trim();
           continue;
         }
-        // 移除 XML tags，正規化空白
         text = text.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
-        if (text) return { name: text.slice(0, 40), entrypoint, gitBranch };
+        if (text) name = text.slice(0, 40);
       } catch {}
     }
-    return { name: firstCommand ? `/${firstCommand}` : '', entrypoint, gitBranch };
+    if (!name && firstCommand) name = `/${firstCommand}`;
+    // 快速計算 user prompt 數（精確字串匹配，排除 tool_result 和嵌入內容）
+    let promptCount = 0;
+    let pos = 0;
+    const marker = '"type":"user","message":{"role":"user","content":"';
+    while ((pos = content.indexOf(marker, pos)) !== -1) {
+      const lineStart = content.lastIndexOf('\n', pos) + 1;
+      const lineEnd = content.indexOf('\n', pos);
+      const line = content.slice(lineStart, lineEnd === -1 ? undefined : lineEnd);
+      if (!line.includes('"isMeta":true')) promptCount++;
+      pos += marker.length;
+    }
+    return { name, entrypoint, gitBranch, promptCount };
   } catch {}
-  return { name: '', entrypoint: '', gitBranch: '' };
+  return { name: '', entrypoint: '', gitBranch: '', promptCount: 0 };
 }
 
 /** 合併三個 store，sessionId 去重但互相補充欄位。支援多 cwd（跨 project） */
@@ -811,7 +823,7 @@ function getMergedSessions(cwd: string, addDirs?: string[]): SessionEntry[] {
       const existing = map.get(s.sessionId);
       if (existing) {
         if (s.startedAt) existing.startedAt = s.startedAt;
-        if (s.name && s.name !== 'unnamed') {
+        if (existing.name === 'unnamed' && s.name && s.name !== 'unnamed') {
           existing.name = s.name;
         } else if (existing.name && existing.name !== 'unnamed' && s._cliJsonPath) {
           // CLI name 是 unnamed 但 project 有好名稱 → 寫回 CLI JSON
@@ -849,6 +861,7 @@ function getSessionTailInfo(sessionId: string, cwd: string): { contextPercent: s
     const fd = openSync(jsonlPath, 'r');
     try {
       const fileSize = statSync(jsonlPath).size;
+      // 先讀尾部 32KB（context% 一定在最末端）
       const tailSize = Math.min(32768, fileSize);
       const buf = Buffer.alloc(tailSize);
       readSync(fd, buf, 0, tailSize, fileSize - tailSize);
@@ -871,6 +884,27 @@ function getSessionTailInfo(sessionId: string, cwd: string): { contextPercent: s
           }
           if (contextPercent && customTitle) break;
         } catch {}
+      }
+      // customTitle 可能在更前面（長 session 經過 compaction），往前搜索 256KB chunks
+      if (!customTitle && fileSize > tailSize) {
+        const chunkSize = 262144;
+        let searchEnd = fileSize - tailSize;
+        while (!customTitle && searchEnd > 0) {
+          const start = Math.max(0, searchEnd - chunkSize);
+          const readSize = searchEnd - start;
+          const buf2 = Buffer.alloc(readSize);
+          readSync(fd, buf2, 0, readSize, start);
+          const text = buf2.toString('utf-8');
+          // 快速篩選：只 parse 含 "custom-title" 的行
+          for (const line of text.split('\n').reverse()) {
+            if (!line.includes('"custom-title"')) continue;
+            try {
+              const obj = JSON.parse(line);
+              if (obj.type === 'custom-title' && obj.customTitle) { customTitle = obj.customTitle; break; }
+            } catch {}
+          }
+          searchEnd = start;
+        }
       }
       return { contextPercent, customTitle };
     } finally { closeSync(fd); }
@@ -900,19 +934,22 @@ function listSessions(cwd: string, limit: number, addDirs?: string[]): string[] 
         if (tail.contextPercent || tail.customTitle) break;
       }
       const ctxStr = tail.contextPercent ? ` ${tail.contextPercent}` : '';
+      const prompts = s.messageCount ? ` ${s.messageCount}p` : '';
       const src = s.entrypoint === 'sdk-cli' ? ' bot' : ' cli';
       const proj = s.projectName || '';
       const page = s.pageFile ? ` [${s.pageFile}]` : '';
-      // 有 pageFile 時用 pageFile，否則用 customTitle + name 或 name
+      // customTitle 優先用 SessionEntry（來自 index），否則用 tail（來自 JSONL）
+      const title = s.customTitle || tail.customTitle;
+      // 有 pageFile 時用 pageFile，否則顯示 (customTitle) + first prompt
       let displayName: string;
       if (s.pageFile) {
         displayName = page;
-      } else if (tail.customTitle) {
-        displayName = ` ${tail.customTitle} ${s.name}`;
+      } else if (title) {
+        displayName = ` (${title}) ${s.name}`;
       } else {
         displayName = ` ${s.name}`;
       }
-      return `${proj}/${id} ${ago}${ctxStr}${src}${displayName}`;
+      return `${proj}/${id} ${ago}${ctxStr}${prompts}${src}${displayName}`;
     });
 }
 
