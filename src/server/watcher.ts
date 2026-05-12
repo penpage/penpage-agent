@@ -383,6 +383,7 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
       cacheCreation: runResult.result?.cacheCreation,
       contextUsed: runResult.result?.contextUsed,
       contextWindow: runResult.result?.contextWindow,
+      apiCalls: runResult.result?.turns,
       started: startTime,
       completed: endTime,
     });

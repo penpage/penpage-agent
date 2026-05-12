@@ -399,6 +399,7 @@ export function startTelegramBot(cwd: string) {
       cacheCreation: result.result?.cacheCreation,
       contextUsed: result.result?.contextUsed,
       contextWindow: result.result?.contextWindow,
+      apiCalls: result.result?.turns,
       durationSec: botDurSec,
     };
     const info = formatSessionLine(sessionLineData);
@@ -443,29 +444,8 @@ export function startTelegramBot(cwd: string) {
       durationSec: botDurSec,
     }));
 
-    // Auto compact：context > 70% 時自動壓縮
-    if (result.result && sessionData.sessionId) {
-      const r = result.result;
-      if (r.contextUsed && r.contextWindow) {
-        const pct = (r.contextUsed / r.contextWindow) * 100;
-        if (pct > 70) {
-          console.log(`  🔄 Auto compact: ctx ${pct.toFixed(0)}% > 70%`);
-          try {
-            const compactResult = await compactSession(sessionData.sessionId, cwd);
-            const cr = compactResult.result;
-            const compactInfo = formatCompactInfo({
-              beforeCtxUsed: r.contextUsed, beforeCtxWindow: r.contextWindow,
-              beforeCacheRead: r.cacheRead, beforeInputTokens: r.inputTokens, beforeOutputTokens: r.outputTokens,
-              afterCtxUsed: cr?.contextUsed, afterCtxWindow: cr?.contextWindow,
-              afterCacheRead: cr?.cacheRead, afterInputTokens: cr?.inputTokens, afterOutputTokens: cr?.outputTokens,
-            });
-            await ctx.reply(`✅auto-compact ${compactInfo}`);
-          } catch {
-            console.log('  ⚠️ Auto compact failed');
-          }
-        }
-      }
-    }
+    // Auto compact 已移除 — 改依賴 Claude Code CLI 內建 compact 機制
+    // 使用者仍可手動 /compact
 
     // 同步更新 .sessions.json（讓 file watcher / PenPage 看到）
     {

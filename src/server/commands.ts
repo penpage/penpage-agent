@@ -456,6 +456,26 @@ function getSessionDetail(entry: SessionEntry, cwd: string): string {
     lines.push(`- Cache read: ${cacheReadTokens.toLocaleString()}`);
     lines.push(`- Cache create: ${cacheCreateTokens.toLocaleString()}`);
     lines.push(`- **Total: ${totalTokens.toLocaleString()}**`);
+    if (entry.messageCount && entry.messageCount > 0) {
+      const p = entry.messageCount;
+      const avg = (n: number) => Math.round(n / p).toLocaleString();
+      lines.push('');
+      lines.push(`**Avg token/prompt** (${p}p):`);
+      lines.push(`- Cache read: ${avg(cacheReadTokens)}`);
+      lines.push(`- Cache create: ${avg(cacheCreateTokens)}`);
+      lines.push(`- Input: ${avg(inputTokens)}`);
+      lines.push(`- Output: ${avg(outputTokens)}`);
+    }
+    if (assistantMsgs > 0) {
+      const a = assistantMsgs;
+      const avg = (n: number) => Math.round(n / a).toLocaleString();
+      lines.push('');
+      lines.push(`**Avg token/api call** (${a} calls):`);
+      lines.push(`- Cache read: ${avg(cacheReadTokens)}`);
+      lines.push(`- Cache create: ${avg(cacheCreateTokens)}`);
+      lines.push(`- Input: ${avg(inputTokens)}`);
+      lines.push(`- Output: ${avg(outputTokens)}`);
+    }
     lines.push('');
   }
 
@@ -940,12 +960,12 @@ function listSessions(cwd: string, limit: number, addDirs?: string[]): string[] 
       const page = s.pageFile ? ` [${s.pageFile}]` : '';
       // customTitle 優先用 SessionEntry（來自 index），否則用 tail（來自 JSONL）
       const title = s.customTitle || tail.customTitle;
-      // 有 pageFile 時用 pageFile，否則顯示 (customTitle) + first prompt
+      // customTitle 優先顯示，pageFile 次之
       let displayName: string;
-      if (s.pageFile) {
+      if (title) {
+        displayName = s.pageFile ? ` (${title})${page}` : ` (${title}) ${s.name}`;
+      } else if (s.pageFile) {
         displayName = page;
-      } else if (title) {
-        displayName = ` (${title}) ${s.name}`;
       } else {
         displayName = ` ${s.name}`;
       }

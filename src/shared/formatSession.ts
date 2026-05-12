@@ -11,6 +11,7 @@ export interface SessionDisplayData {
   cacheCreation?: number;
   contextUsed?: number;
   contextWindow?: number;
+  apiCalls?: number;
   started?: string;
   completed?: string;
   durationSec?: number;
@@ -52,6 +53,12 @@ export function formatSessionLine(data: SessionDisplayData): string {
     const i = fmtTokens(data.inputTokens || 0);
     const o = fmtTokens(data.outputTokens || 0);
     parts.push(`cio:(${cr}+${cc}+${i}+${o})/${fmtTokens(data.contextWindow)}`);
+  }
+
+  // apiCalls + avg cache read per call（≈ context 長度）
+  if (data.apiCalls && data.apiCalls > 0) {
+    const avgCR = fmtTokens(Math.round((data.cacheRead || 0) / data.apiCalls));
+    parts.push(`${data.apiCalls}api cr:${avgCR}`);
   }
 
   // model 放最後
