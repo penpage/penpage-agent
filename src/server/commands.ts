@@ -318,22 +318,30 @@ function handleSession(args: string[], ctx: CommandContext): CommandResult {
       return { markdown: 'Usage: `/session info <number>` — show session details with token usage.' };
     }
 
+    // 支援 project/sessionId 格式（如 ppage-agent/4e0e5481）
+    let searchCwd = ctx.cwd;
+    let searchId = target;
+    if (target.includes('/')) {
+      const [proj, id] = target.split('/', 2);
+      const resolved = resolveProjectCwd(proj);
+      if (resolved) { searchCwd = resolved; searchId = id; }
+    }
+
     // 找到目標 session
-    const addDirs = ctx.sessionData.addDirs;
-    const sessions = getMergedSessions(ctx.cwd, addDirs);
+    const sessions = getMergedSessions(searchCwd, searchCwd === ctx.cwd ? ctx.sessionData.addDirs : undefined);
     let entry: SessionEntry | undefined;
-    if (/^\d+$/.test(target)) {
-      const idx = parseInt(target) - 1;
+    if (/^\d+$/.test(searchId)) {
+      const idx = parseInt(searchId) - 1;
       if (idx >= 0 && idx < sessions.length) entry = sessions[idx];
     } else {
       // 用 sessionId prefix 匹配
-      entry = sessions.find(s => s.sessionId.startsWith(target));
+      entry = sessions.find(s => s.sessionId.startsWith(searchId));
     }
     if (!entry) {
       return { markdown: `Session not found: \`${target}\`. Use \`/session\` to list.` };
     }
 
-    return { markdown: getSessionDetail(entry, ctx.cwd) };
+    return { markdown: getSessionDetail(entry, searchCwd) };
   }
 
   // /session N — resume 第 N 個 session
@@ -578,6 +586,8 @@ interface SessionEntry {
   projectName?: string;
   pageFile?: string;
   entrypoint?: string;
+  gitBranch?: string;
+  fileSize?: number;
 }
 
 /** 讀取 .penpage/.sessions.json 中的 page sessions */
@@ -654,6 +664,54 @@ function extractProjectName(cwd: string): string {
   return cwd.replace(/\/+$/, '').split('/').pop() || 'unknown';
 }
 
+/** 取得所有 project 的 { dirName, cwd, name } */
+function getAllProjects(): Array<{ dirName: string; cwd: string; name: string }> {
+  const projectsDir = join(homedir(), '.claude', 'projects');
+  try {
+    return readdirSync(projectsDir)
+      .filter(d => {
+        try { return statSync(join(projectsDir, d)).isDirectory(); } catch { return false; }
+      })
+      .map(d => {
+        // 嘗試用已知路徑正向比對，否則 fallback 到替換
+        const cwd = tryResolveCwd(d);
+        return { dirName: d, cwd, name: extractProjectName(cwd) };
+      });
+  } catch { return []; }
+}
+
+/** 從 project 目錄名嘗試還原 cwd（用 existsSync 驗證） */
+function tryResolveCwd(dirName: string): string {
+  // 先嘗試直接替換（適用於路徑不含 - 的情況）
+  const simple = dirName.replace(/^-/, '/').replace(/-/g, '/');
+  if (existsSync(simple)) return simple;
+  // 嘗試常見的 hyphenated 目錄名模式（如 ppage-agent → ppage-agent/）
+  // 從右往左嘗試把 - 保留為 hyphen 而非 /
+  const parts = dirName.replace(/^-/, '').split('-');
+  for (let i = parts.length - 1; i >= 1; i--) {
+    const candidate = '/' + parts.slice(0, i).join('/') + '/' + parts.slice(i).join('-');
+    if (existsSync(candidate)) return candidate;
+  }
+  return simple;
+}
+
+/** 從 project 短名反查 cwd */
+function resolveProjectCwd(projectName: string): string | null {
+  for (const p of getAllProjects()) {
+    if (p.name === projectName) return p.cwd;
+  }
+  return null;
+}
+
+/** 列出所有 projects */
+function listProjects(): string[] {
+  return getAllProjects().map(p => {
+    const projectsDir = join(homedir(), '.claude', 'projects');
+    const sessionCount = readdirSync(join(projectsDir, p.dirName)).filter(f => f.endsWith('.jsonl')).length;
+    return `${p.name}  ${p.cwd}  ${sessionCount} sessions`;
+  });
+}
+
 /** 讀取 project sessions：JSONL 掃描為主，sessions-index.json 補充 metadata */
 function listProjectSessions(cwd: string): SessionEntry[] {
   const projectDir = getProjectDir(cwd);
@@ -690,10 +748,12 @@ function listProjectSessions(cwd: string): SessionEntry[] {
         sessionId,
         name,
         startedAt: idx ? new Date(idx.created).getTime() : mtime,
-        modifiedAt: idx ? new Date(idx.modified).getTime() : mtime,
+        modifiedAt: mtime, // JSONL mtime = 最後使用時間（最可靠）
         messageCount: idx?.messageCount,
         projectName,
         entrypoint: meta.entrypoint,
+        gitBranch: idx?.gitBranch || meta.gitBranch,
+        fileSize: statSync(fullPath).size,
       });
     }
   } catch {}
@@ -701,19 +761,21 @@ function listProjectSessions(cwd: string): SessionEntry[] {
   return results;
 }
 
-/** 從 JSONL 前 8KB 提取第一條 user message 的名稱和 entrypoint */
-function extractMetaFromJsonl(fullPath: string): { name: string; entrypoint: string } {
+/** 從 JSONL 前 8KB 提取第一條 user message 的名稱、entrypoint、gitBranch */
+function extractMetaFromJsonl(fullPath: string): { name: string; entrypoint: string; gitBranch: string } {
   try {
     const chunk = readFileSync(fullPath, { encoding: 'utf-8', flag: 'r' }).slice(0, 8192);
     let entrypoint = '';
+    let gitBranch = '';
     let firstCommand = '';
     for (const line of chunk.split('\n')) {
       if (!line.trim()) continue;
       try {
         const obj = JSON.parse(line);
         if (obj.type !== 'user' || obj.isMeta) continue;
-        // 取第一個 user message 的 entrypoint
+        // 取第一個 user message 的 entrypoint 和 gitBranch
         if (!entrypoint) entrypoint = obj.entrypoint || '';
+        if (!gitBranch) gitBranch = obj.gitBranch || '';
         const msg = obj.message;
         // 跳過 tool_result（content 是 array）
         if (typeof msg?.content !== 'string') continue;
@@ -726,12 +788,12 @@ function extractMetaFromJsonl(fullPath: string): { name: string; entrypoint: str
         }
         // 移除 XML tags，正規化空白
         text = text.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
-        if (text) return { name: text.slice(0, 40), entrypoint };
+        if (text) return { name: text.slice(0, 40), entrypoint, gitBranch };
       } catch {}
     }
-    return { name: firstCommand ? `/${firstCommand}` : '', entrypoint };
+    return { name: firstCommand ? `/${firstCommand}` : '', entrypoint, gitBranch };
   } catch {}
-  return { name: '', entrypoint: '' };
+  return { name: '', entrypoint: '', gitBranch: '' };
 }
 
 /** 合併三個 store，sessionId 去重但互相補充欄位。支援多 cwd（跨 project） */
@@ -777,39 +839,49 @@ function getMergedSessions(cwd: string, addDirs?: string[]): SessionEntry[] {
     }
   }
 
-  return [...map.values()].sort((a, b) => b.startedAt - a.startedAt);
+  return [...map.values()].sort((a, b) => (b.modifiedAt || b.startedAt) - (a.modifiedAt || a.startedAt));
 }
 
-/** 列出 Claude sessions（合併 CLI + page sessions） */
-/** 從 JSONL 尾部讀取最後一筆 assistant usage，回傳 context 使用百分比 */
-function getContextPercent(sessionId: string, cwd: string): string {
+/** 從 JSONL 尾部讀取 context 百分比 + customTitle */
+function getSessionTailInfo(sessionId: string, cwd: string): { contextPercent: string; customTitle: string } {
   const jsonlPath = join(getProjectDir(cwd), `${sessionId}.jsonl`);
   try {
     const fd = openSync(jsonlPath, 'r');
     try {
       const fileSize = statSync(jsonlPath).size;
-      // 讀尾部 32KB（通常足夠找到最後幾筆 assistant）
       const tailSize = Math.min(32768, fileSize);
       const buf = Buffer.alloc(tailSize);
       readSync(fd, buf, 0, tailSize, fileSize - tailSize);
       const chunk = buf.toString('utf-8');
       const lines = chunk.split('\n').reverse();
+      let contextPercent = '';
+      let customTitle = '';
       for (const line of lines) {
         if (!line.trim()) continue;
         try {
           const obj = JSON.parse(line);
-          if (obj.type === 'assistant' && obj.message?.usage) {
+          if (!contextPercent && obj.type === 'assistant' && obj.message?.usage) {
             const u = obj.message.usage;
             const ctx = (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
-            // Opus 200K context window
             const pct = Math.round((ctx / 200000) * 100);
-            return `${pct}%`;
+            contextPercent = `${pct}%`;
           }
+          if (!customTitle && obj.type === 'custom-title' && obj.customTitle) {
+            customTitle = obj.customTitle;
+          }
+          if (contextPercent && customTitle) break;
         } catch {}
       }
+      return { contextPercent, customTitle };
     } finally { closeSync(fd); }
   } catch {}
-  return '';
+  return { contextPercent: '', customTitle: '' };
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
 function listSessions(cwd: string, limit: number, addDirs?: string[]): string[] {
@@ -818,19 +890,28 @@ function listSessions(cwd: string, limit: number, addDirs?: string[]): string[] 
     .slice(0, limit)
     .map(s => {
       const id = s.sessionId.slice(0, 8);
-      const ago = timeAgo(s.startedAt).replace(' ago', '');
-      // 從任一 project dir 找 context percent
-      let ctx = '';
+      const lastUsed = timeAgo(s.modifiedAt || s.startedAt).replace(' ago', '');
+      const created = timeAgo(s.startedAt).replace(' ago', '');
+      const ago = lastUsed === created ? lastUsed : `${lastUsed}/${created}`;
+      // 從任一 project dir 找 tail info（context % + customTitle）
+      let tail = { contextPercent: '', customTitle: '' };
       for (const dir of cwds) {
-        ctx = getContextPercent(s.sessionId, dir);
-        if (ctx) break;
+        tail = getSessionTailInfo(s.sessionId, dir);
+        if (tail.contextPercent || tail.customTitle) break;
       }
-      const ctxStr = ctx ? ` ${ctx}` : '';
+      const ctxStr = tail.contextPercent ? ` ${tail.contextPercent}` : '';
       const src = s.entrypoint === 'sdk-cli' ? ' bot' : ' cli';
       const proj = s.projectName || '';
       const page = s.pageFile ? ` [${s.pageFile}]` : '';
-      // 有 pageFile 時用 pageFile 作為名稱，不重複顯示 name
-      const displayName = s.pageFile ? page : ` ${s.name}`;
+      // 有 pageFile 時用 pageFile，否則用 customTitle + name 或 name
+      let displayName: string;
+      if (s.pageFile) {
+        displayName = page;
+      } else if (tail.customTitle) {
+        displayName = ` ${tail.customTitle} ${s.name}`;
+      } else {
+        displayName = ` ${s.name}`;
+      }
       return `${proj}/${id} ${ago}${ctxStr}${src}${displayName}`;
     });
 }
@@ -875,12 +956,44 @@ function handleLs(args: string[], ctx: CommandContext): CommandResult {
     return { markdown: `**Pages:**\n\n${list}` };
   }
 
-  // /ls session
+  // /ls session [project-name|all] [N]
   if (sub === 'session' || sub === 'sessions') {
-    const items = listSessions(ctx.cwd, customLimit ?? DEFAULT_LIMIT, ctx.sessionData.addDirs);
+    // 找非數字的額外參數作為 project filter
+    const projectArg = args.slice(1).find(a => !/^\d+$/.test(a));
+    let cwd = ctx.cwd;
+    let addDirs = ctx.sessionData.addDirs;
+
+    if (projectArg === 'all') {
+      // 掃所有 projects：用第一個作為 cwd，其餘作為 addDirs
+      const projectsDir = join(homedir(), '.claude', 'projects');
+      try {
+        const allCwds = readdirSync(projectsDir)
+          .filter(d => { try { return statSync(join(projectsDir, d)).isDirectory(); } catch { return false; } })
+          .map(d => d.replace(/^-/, '/').replace(/-/g, '/'));
+        if (allCwds.length > 0) {
+          cwd = allCwds[0];
+          addDirs = allCwds.slice(1);
+        }
+      } catch {}
+    } else if (projectArg) {
+      const resolved = resolveProjectCwd(projectArg);
+      if (!resolved) return { markdown: `Project not found: \`${projectArg}\`. Use \`/ls project\` to see available projects.` };
+      cwd = resolved;
+      addDirs = undefined;
+    }
+
+    const items = listSessions(cwd, customLimit ?? DEFAULT_LIMIT, addDirs);
     if (items.length === 0) return { markdown: 'No sessions found.' };
     const list = items.map((s, i) => `${i + 1}. ${s}`).join('\n');
     return { markdown: `**Sessions:**\n\n${list}\n\nUse \`/session N\` to resume.` };
+  }
+
+  // /ls project
+  if (sub === 'project' || sub === 'projects') {
+    const items = listProjects();
+    if (items.length === 0) return { markdown: 'No projects found.' };
+    const list = items.map((s, i) => `${i + 1}. ${s}`).join('\n');
+    return { markdown: `**Projects:**\n\n${list}` };
   }
 
   // /ls plan
