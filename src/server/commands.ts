@@ -960,12 +960,12 @@ function listSessions(cwd: string, limit: number, addDirs?: string[]): string[] 
       const page = s.pageFile ? ` [${s.pageFile}]` : '';
       // customTitle 優先用 SessionEntry（來自 index），否則用 tail（來自 JSONL）
       const title = s.customTitle || tail.customTitle;
-      // customTitle 優先顯示，pageFile 次之
+      // customTitle 優先顯示，pageFile 次之，都帶 first-prompt（s.name）
       let displayName: string;
       if (title) {
         displayName = s.pageFile ? ` (${title})${page}` : ` (${title}) ${s.name}`;
       } else if (s.pageFile) {
-        displayName = page;
+        displayName = `${page} ${s.name}`;
       } else {
         displayName = ` ${s.name}`;
       }

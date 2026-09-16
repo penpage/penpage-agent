@@ -403,32 +403,8 @@ async function handleFile(filePath: string, promptDir: string, cwd: string): Pro
       durationSec,
     }));
 
-    // Auto compact：context > 70% 時自動壓縮
-    const finalSid = newSessionId || sessionId;
-    const rr = runResult.result;
-    if (finalSid && rr?.contextUsed && rr?.contextWindow) {
-      const pct = (rr.contextUsed / rr.contextWindow) * 100;
-      if (pct > 70) {
-        logRaw(formatLogLine({ source: 'agent', filename, model: actualModel, sessionId: finalSid, command: `auto-compact (ctx ${pct.toFixed(0)}%)` }));
-        try {
-          const compactResult = await compactSession(finalSid, cwd);
-          const cr = compactResult.result;
-          const compactInfo = formatCompactInfo({
-            beforeCtxUsed: rr.contextUsed, beforeCtxWindow: rr.contextWindow,
-            beforeCacheRead: rr.cacheRead, beforeInputTokens: rr.inputTokens, beforeOutputTokens: rr.outputTokens,
-            afterCtxUsed: cr?.contextUsed, afterCtxWindow: cr?.contextWindow,
-            afterCacheRead: cr?.cacheRead, afterInputTokens: cr?.inputTokens, afterOutputTokens: cr?.outputTokens,
-          });
-          const acTs = shortDateTime();
-          writingFiles.add(filePath);
-          appendFileSync(filePath, `\n\`\`\`\n${acTs} ✅auto-compact ${compactInfo}\n\`\`\`\n`);
-          setTimeout(() => writingFiles.delete(filePath), 500);
-          logRaw(formatLogLine({ source: 'agent', filename, model: actualModel, sessionId: finalSid, status: `auto-compacted ${compactInfo}` }));
-        } catch {
-          logRaw(formatLogLine({ source: 'agent', filename, model: actualModel, sessionId: finalSid, status: 'auto-compact-err' }));
-        }
-      }
-    }
+    // Auto compact 已移除 — 改依賴 Claude Code CLI 內建 compact 機制
+    // 使用者仍可手動 /compact
   } catch (err: any) {
     appendToFile(filePath, `\n\n*Error: ${err.message}*\n\n---\n`);
     logRaw(formatLogLine({ source: 'agent', filename, model: modelDisplay, sessionId, status: `err:${err.message}` }));

@@ -411,9 +411,9 @@ export function startTelegramBot(cwd: string) {
       if (r.contextUsed && r.contextWindow) {
         const pct = Math.round((r.contextUsed / r.contextWindow) * 100);
         if (pct > 85) {
-          contextWarning = '\n⚠️ Context 即將滿載，自動壓縮中...';
+          contextWarning = '\n⚠️ Context > 85%';
         } else if (pct > 70) {
-          contextWarning = '\n⚡ Context > 70%，自動壓縮中...';
+          contextWarning = '\n⚡ Context > 70%';
         }
       }
       await ctx.reply(`✅${info}${contextWarning}`);
